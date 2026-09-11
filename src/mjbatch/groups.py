@@ -4,15 +4,12 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Sequence, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
 
 import numpy as np
 
 if TYPE_CHECKING:
   from mjbatch import Batch
-
-
-Ids: TypeAlias = "np.ndarray | None"
 
 
 @dataclass(frozen=True)
@@ -90,16 +87,6 @@ class ModelAffineBatch:
     self._groups = tuple(groups)
     self._by_name = {group.name: group for group in groups}
 
-  @classmethod
-  def from_batches(
-    cls,
-    batches: Sequence[Batch],
-    assignments: Sequence[np.ndarray] | None = None,
-    *,
-    names: Sequence[str] | None = None,
-  ) -> "ModelAffineBatch":
-    return cls(batches, assignments, names=names)
-
   @property
   def groups(self) -> tuple[TopologyGroup, ...]:
     return self._groups
@@ -125,7 +112,7 @@ class ModelAffineBatch:
   def __getitem__(self, key: str | int) -> TopologyGroup:
     return self.group(key)
 
-  def _normalize_ids(self, ids: Any) -> Ids:
+  def _normalize_ids(self, ids: Any) -> np.ndarray | None:
     if ids is None:
       return None
     array = np.ascontiguousarray(ids)
@@ -142,11 +129,11 @@ class ModelAffineBatch:
       raise ValueError("ids must be sorted, unique and in range")
     return array
 
-  def _split_ids(self, ids: Any) -> list[Ids]:
+  def _split_ids(self, ids: Any) -> list[np.ndarray | None]:
     global_ids = self._normalize_ids(ids)
     if global_ids is None:
       return [None] * self.num_groups
-    result: list[Ids] = []
+    result: list[np.ndarray | None] = []
     for group in self._groups:
       positions = np.searchsorted(group.global_ids, global_ids)
       valid = positions < group.global_ids.size
@@ -157,40 +144,35 @@ class ModelAffineBatch:
   def step(self, ids: Any = None, nstep: int = 1, history: Any = None) -> None:
     if history is not None:
       raise ValueError("global history is unsupported across topologies; collect state from each group")
-    selections = self._split_ids(ids)
-    for group, local_ids in zip(self.groups, selections, strict=True):
-      if local_ids is not None and local_ids.size == 0:
-        continue
-      group.batch.step(local_ids, nstep=nstep)
+    self._dispatch(ids, lambda group, local_ids: group.batch.step(local_ids, nstep=nstep))
 
   def forward(self, ids: Any = None) -> None:
-    selections = self._split_ids(ids)
-    for group, local_ids in zip(self.groups, selections, strict=True):
-      if local_ids is not None and local_ids.size == 0:
-        continue
-      group.batch.forward(local_ids)
+    self._dispatch(ids, lambda group, local_ids: group.batch.forward(local_ids))
 
   def reset(self, ids: Any = None, keyframe: int = -1) -> None:
     if keyframe >= 0 and any(keyframe >= group.batch.model.nkey for group in self.groups):
       raise ValueError("keyframe out of range for at least one topology group")
-    selections = self._split_ids(ids)
-    for group, local_ids in zip(self.groups, selections, strict=True):
-      if local_ids is not None and local_ids.size == 0:
-        continue
-      group.batch.reset(local_ids, keyframe=keyframe)
+    self._dispatch(ids, lambda group, local_ids: group.batch.reset(local_ids, keyframe=keyframe))
 
   def set_const(self, ids: Any = None) -> None:
-    selections = self._split_ids(ids)
-    for group, local_ids in zip(self.groups, selections, strict=True):
-      if local_ids is not None and local_ids.size == 0:
-        continue
-      group.batch.set_const(local_ids)
+    self._dispatch(ids, lambda group, local_ids: group.batch.set_const(local_ids))
 
   @contextmanager
-  def model_update(self, ids: Any = None) -> Iterator[None]:
-    """Run per-group model updates with one global selection boundary."""
+  def model_update(self, *fields: str, ids: Any = None) -> Iterator[None]:
+    """Run declared per-group model updates with one global selection boundary."""
     selections = self._split_ids(ids)
     with ExitStack() as stack:
       for group, local_ids in zip(self.groups, selections, strict=True):
-        stack.enter_context(group.batch.model_update(local_ids))
+        stack.enter_context(group.batch.model_update(*fields, ids=local_ids))
       yield
+
+  def _dispatch(
+    self,
+    ids: Any,
+    operation: Callable[[TopologyGroup, np.ndarray | None], None],
+  ) -> None:
+    selections = self._split_ids(ids)
+    for group, local_ids in zip(self.groups, selections, strict=True):
+      if local_ids is not None and local_ids.size == 0:
+        continue
+      operation(group, local_ids)

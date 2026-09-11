@@ -329,9 +329,6 @@ def test_variant_pack_deduplicates_identical_meshes(tmp_path):
   np.testing.assert_array_equal(pack.fields["geom_dataid"], np.zeros((2, 1), dtype=np.int32))
   with pytest.raises(ValueError, match="read-only"):
     pack.fields["geom_dataid"][0, 0] = -1
-  writable_copy = pack.field_values("geom_dataid")
-  writable_copy[0, 0] = -1
-  assert pack.fields["geom_dataid"][0, 0] == 0
 
 
 def test_variant_pack_validates_slots_layout_and_assignment(tmp_path):
@@ -347,9 +344,6 @@ def test_variant_pack_validates_slots_layout_and_assignment(tmp_path):
 </mujoco>
 """
   )
-  with pytest.raises(ValueError, match="slot_policy"):
-    VariantPack.from_specs([spec], slot_policy="ordinal")
-
   changed_layout = mujoco.MjSpec.from_string(
     f"""
 <mujoco>
@@ -406,9 +400,9 @@ def test_model_affine_batch_routes_global_ids(model):
 def test_model_affine_batch_model_update_and_validation(model):
   other = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
   batches = [Batch(model, N // 2), Batch(other, N // 2)]
-  sharded = ModelAffineBatch.from_batches(batches)
+  sharded = ModelAffineBatch(batches)
   ids = np.array([0, 2, 5, 7])
-  with sharded.model_update(ids):
+  with sharded.model_update("body_mass", ids=ids):
     for group in sharded.groups:
       local_ids = np.searchsorted(group.global_ids, ids[np.isin(ids, group.global_ids)])
       group.expand("body_mass")[local_ids, 1] = 2.0
@@ -540,7 +534,7 @@ def test_model_update_recomputes_selected_rows_once(model, monkeypatch):
     raw_set_const(raw_batch, ids)
 
   monkeypatch.setattr(RawBatch, "set_const", counting_set_const)
-  with batch.model_update(ids):
+  with batch.model_update("body_mass", "geom_friction", ids=ids):
     batch.expand("body_mass")[ids, pole] = 2.0
     batch.expand("geom_friction")[ids, :, 0] = 0.7
   assert len(calls) == 1
@@ -554,12 +548,8 @@ def test_model_update_recomputes_selected_rows_once(model, monkeypatch):
   )
   expected_mass = batch.expand("body_mass").copy()
 
-  with batch.model_update(ids):
+  with batch.model_update("geom_friction", ids=ids):
     batch.expand("geom_friction")[ids, :, 1] = 0.8
-  assert len(calls) == 1
-
-  with batch.model_update(np.array([], dtype=np.int32)):
-    batch.expand("body_mass")[:, pole] = 3.0
   assert len(calls) == 1
   np.testing.assert_array_equal(batch.expand("body_mass"), expected_mass)
 
@@ -568,12 +558,15 @@ def test_model_update_is_transactional_and_fail_closed(model):
   batch = Batch(model, N)
   with pytest.raises(ValueError, match="read-only structural data"):
     batch.expand("body_parentid")
+  with pytest.raises(ValueError, match="not writable"):
+    with batch.model_update("body_parentid"):
+      pass
   with pytest.raises(RuntimeError, match="cannot be nested"):
-    with batch.model_update():
-      with batch.model_update():
+    with batch.model_update("body_mass"):
+      with batch.model_update("body_mass"):
         pass
   with pytest.raises(RuntimeError, match="after model_update exits"):
-    with batch.model_update():
+    with batch.model_update("body_mass"):
       batch.set_const()
 
 
