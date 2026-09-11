@@ -231,6 +231,53 @@ struct Scalars {
   }
 };
 
+// Per-call context for the query ops (JacSite, SampleHfield): outputs are
+// caller-allocated arrays, one row per selected sim, like step's history.
+struct QueryCtx {
+  int site = -1;              // JacSite: site id
+  mjtNum* jacp = nullptr;     // (sel, 3, nv) rows, either may be null
+  mjtNum* jacr = nullptr;
+  int geom = -1, body = -1;   // SampleHfield: hfield geom id, frame body id
+  const mjtNum* offsets = nullptr;  // (npoint, 2) world-frame XY around the body origin
+  int npoint = 0;
+  mjtNum* out = nullptr;      // (sel, npoint) rows
+};
+
+// Bilinear height sampling of one hfield geom at world-frame XY points given as
+// offsets from a frame body's origin. Points are transformed into the geom's
+// local frame (its pose comes from the sim's mjData, so per-sim geom_pos applies);
+// the hfield grid itself is the model's, shared by all sims. Returns local
+// heights (interp * size[2]); the grid mapping and clamping match MuJoCo's
+// hfield contact convention for the XY extent [-size[0], size[0]] x
+// [-size[1], size[1]].
+inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx) {
+  int hfield = m->geom_dataid[ctx.geom];
+  int nrow = m->hfield_nrow[hfield], ncol = m->hfield_ncol[hfield];
+  const mjtNum* hsize = m->hfield_size + static_cast<size_t>(4) * hfield;
+  const float* data = m->hfield_data + static_cast<size_t>(hfield) * nrow * ncol;
+  const mjtNum* gpos = d->geom_xpos + 3 * ctx.geom;
+  const mjtNum* gmat = d->geom_xmat + 9 * ctx.geom;
+  const mjtNum* bpos = d->xpos + 3 * ctx.body;
+  for (int k = 0; k < ctx.npoint; ++k) {
+    mjtNum wp[3] = {bpos[0] + ctx.offsets[2 * k], bpos[1] + ctx.offsets[2 * k + 1], gpos[2]};
+    mjtNum rel[3], lp[3];
+    mju_sub3(rel, wp, gpos);
+    mju_mulMatTVec(lp, gmat, rel, 3, 3);
+    mjtNum fx = (lp[0] / hsize[0] + 1.0) * 0.5 * (ncol - 1);
+    mjtNum fy = (lp[1] / hsize[1] + 1.0) * 0.5 * (nrow - 1);
+    fx = std::min(std::max(fx, 0.0), ncol - 1.001);
+    fy = std::min(std::max(fy, 0.0), nrow - 1.001);
+    int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
+    mjtNum sx = fx - ix, sy = fy - iy;
+    int ix1 = std::min(ix + 1, ncol - 1), iy1 = std::min(iy + 1, nrow - 1);
+    mjtNum h = (1 - sx) * (1 - sy) * data[iy * ncol + ix] +
+               sx * (1 - sy) * data[iy * ncol + ix1] +
+               (1 - sx) * sy * data[iy1 * ncol + ix] +
+               sx * sy * data[iy1 * ncol + ix1];
+    ctx.out[k] = h * hsize[2];
+  }
+}
+
 // mju_error trap for worker threads: record the message and unwind to the
 // worker's setjmp; everything else goes to the handler that was active before.
 inline thread_local std::jmp_buf* tls_jmp = nullptr;
@@ -247,7 +294,7 @@ inline void InstallLogTrap() { prev_log_handler = mju_setLogHandler(LogTrap); }
 
 class Batch {
  public:
-  enum class Op { Step, Forward, Reset, SetConst };
+  enum class Op { Step, Forward, Reset, SetConst, JacSite, SampleHfield };
   using Ids = nb::ndarray<nb::ndim<1>, nb::c_contig>;
 
   Batch(nb::object model, int num_sims, int num_threads, bool forward)
@@ -360,6 +407,44 @@ class Batch {
     if (!error_.empty()) throw std::runtime_error(error_);
   }
 
+  // mj_jacSite per selected sim into caller-allocated (sel, 3, nv) rows; either
+  // output may be omitted. Runs kinematics and comPos only, not mj_forward.
+  void jac_site(int site, std::optional<nb::ndarray<>> jacp,
+                std::optional<nb::ndarray<>> jacr, std::optional<Ids> ids) {
+    if (site < 0 || site >= template_->nsite) throw nb::value_error("site out of range");
+    auto sel = Parse(ids);
+    int nsel = sel ? static_cast<int>(sel->size()) : num_sims_;
+    QueryCtx ctx;
+    ctx.site = site;
+    ctx.jacp = jacp ? OutPtr(*jacp, nsel, 3, template_->nv, "jacp") : nullptr;
+    ctx.jacr = jacr ? OutPtr(*jacr, nsel, 3, template_->nv, "jacr") : nullptr;
+    if (!ctx.jacp && !ctx.jacr) {
+      throw nb::value_error("jacp and jacr cannot both be None");
+    }
+    Run(Op::JacSite, std::move(sel), 0, nullptr, &ctx);
+  }
+
+  // Bilinear hfield heights per selected sim at world-frame XY offsets around a
+  // frame body's origin, into caller-allocated (sel, npoint) rows. Runs
+  // kinematics only. All sims sample the template's hfield; a per-sim geom_pos
+  // moves the sampling frame.
+  void sample_hfield(int geom, int body, const nb::ndarray<>& offsets, nb::ndarray<> out,
+                     std::optional<Ids> ids) {
+    if (geom < 0 || geom >= template_->ngeom) throw nb::value_error("geom out of range");
+    if (template_->geom_type[geom] != mjGEOM_HFIELD) {
+      throw nb::value_error("geom is not a hfield");
+    }
+    if (body < 0 || body >= template_->nbody) throw nb::value_error("body out of range");
+    auto sel = Parse(ids);
+    int nsel = sel ? static_cast<int>(sel->size()) : num_sims_;
+    QueryCtx ctx;
+    ctx.geom = geom;
+    ctx.body = body;
+    ctx.offsets = OffsetsPtr(offsets, ctx.npoint);
+    ctx.out = OutPtr(out, nsel, 1, ctx.npoint, "out");
+    Run(Op::SampleHfield, std::move(sel), 0, nullptr, &ctx);
+  }
+
  private:
   const FieldInfo& Field(const FieldTable& table, const std::string& name) {
     auto it = table.find(name);
@@ -433,6 +518,46 @@ class Batch {
     return static_cast<mjtNum*>(a.data());
   }
 
+  // Validate a caller-allocated (rows, r, c) mjtNum output array; when r == 1 a
+  // 2D (rows, c) array is accepted too.
+  mjtNum* OutPtr(const nb::ndarray<>& a, int64_t rows, int64_t r, int64_t c,
+                 const char* name) {
+    bool ok3 = a.ndim() == 3 && static_cast<int64_t>(a.shape(0)) == rows &&
+               static_cast<int64_t>(a.shape(1)) == r && static_cast<int64_t>(a.shape(2)) == c;
+    bool ok2 = r == 1 && a.ndim() == 2 && static_cast<int64_t>(a.shape(0)) == rows &&
+               static_cast<int64_t>(a.shape(1)) == c;
+    if (!ok3 && !ok2) {
+      std::string msg = std::string(name) + " must have shape (sel, " + std::to_string(r) +
+                        ", " + std::to_string(c) + ")";
+      throw nb::value_error(msg.c_str());
+    }
+    if (a.dtype() != nb::dtype<mjtNum>()) {
+      throw nb::value_error((std::string(name) + " must be " + DtypeName(Elem::Num)).c_str());
+    }
+    int64_t row = r * c;
+    int64_t s2 = a.stride(a.ndim() - 1), s1 = a.ndim() == 3 ? a.stride(1) : c,
+            s0 = a.stride(0);
+    if (a.device_type() != nb::device::cpu::value || s2 != 1 || s1 != c || s0 != row) {
+      throw nb::value_error((std::string(name) + " must be a C-contiguous CPU array").c_str());
+    }
+    return static_cast<mjtNum*>(a.data());
+  }
+
+  // Validate the (npoint, 2) offsets array of sample_hfield.
+  const mjtNum* OffsetsPtr(const nb::ndarray<>& a, int& npoint) {
+    if (a.ndim() != 2 || a.shape(1) != 2 || a.shape(0) < 1) {
+      throw nb::value_error("offsets must have shape (npoint, 2)");
+    }
+    if (a.dtype() != nb::dtype<mjtNum>()) {
+      throw nb::value_error((std::string("offsets must be ") + DtypeName(Elem::Num)).c_str());
+    }
+    if (a.device_type() != nb::device::cpu::value || a.stride(1) != 1 || a.stride(0) != 2) {
+      throw nb::value_error("offsets must be a C-contiguous CPU array");
+    }
+    npoint = static_cast<int>(a.shape(0));
+    return static_cast<const mjtNum*>(a.data());
+  }
+
   nb::ndarray<nb::numpy> View(const Slot& s) {
     const FieldInfo& f = *s.info;
     size_t shape[3] = {static_cast<size_t>(num_sims_), static_cast<size_t>(f.nr),
@@ -468,7 +593,7 @@ class Batch {
   mjtNum* State(int i) { return states_.data() + static_cast<size_t>(i) * nstate_; }
   mjWarningStat* Warning(int i) { return warnings_.data() + static_cast<size_t>(i) * mjNWARNING; }
 
-  void RunSim(int t, int i, Op op, int arg, mjtNum* hist) {
+  void RunSim(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx) {
     mjModel* m = models_.empty() ? template_ : models_[t];
     mjData* d = data_[t];
     if (op == Op::SetConst) Restore(m);
@@ -516,6 +641,15 @@ class Batch {
       case Op::Reset:
         mj_forward(m, d);
         break;
+      case Op::JacSite:
+        mj_kinematics(m, d);
+        mj_comPos(m, d);
+        mj_jacSite(m, d, ctx->jacp, ctx->jacr, ctx->site);
+        break;
+      case Op::SampleHfield:
+        mj_kinematics(m, d);
+        SampleHfield(m, d, *ctx);
+        break;
       case Op::SetConst:
         break;
     }
@@ -552,11 +686,11 @@ class Batch {
     return out;
   }
 
-  void Guarded(int t, int i, Op op, int arg, mjtNum* hist) {
+  void Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx) {
     std::jmp_buf jb;
     tls_jmp = &jb;
     if (setjmp(jb) == 0) {
-      RunSim(t, i, op, arg, hist);
+      RunSim(t, i, op, arg, hist, ctx);
     } else {
       // The sim's state was not written back; the worker's mjData, left
       // mid-call with its stack and arena in use, serves other sims next.
@@ -569,16 +703,17 @@ class Batch {
     tls_jmp = nullptr;
   }
 
-  void Run(Op op, std::optional<std::vector<int>> sel, int arg, mjtNum* hist = nullptr) {
+  void Run(Op op, std::optional<std::vector<int>> sel, int arg, mjtNum* hist = nullptr,
+           const QueryCtx* ctx = nullptr) {
     nb::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mu_);
     error_.clear();
-    RunLocked(op, sel, arg, hist);
+    RunLocked(op, sel, arg, hist, ctx);
     if (!error_.empty()) throw std::runtime_error(error_);
   }
 
   void RunLocked(Op op, const std::optional<std::vector<int>>& sel, int arg,
-                 mjtNum* hist = nullptr) {
+                 mjtNum* hist = nullptr, const QueryCtx* ctx = nullptr) {
     const int* p = sel ? sel->data() : nullptr;
     const int n = sel ? static_cast<int>(sel->size()) : num_sims_;
     // A per-sim enableflags must not switch on what the constructor refused. Raised
@@ -592,9 +727,18 @@ class Batch {
         }
       }
     }
-    auto fn = [this, op, arg, p, hist](int t, int j) {
+    auto fn = [this, op, arg, p, hist, ctx](int t, int j) {
+      QueryCtx row_ctx;
+      const QueryCtx* c = nullptr;
+      if (ctx) {
+        row_ctx = *ctx;
+        if (row_ctx.jacp) row_ctx.jacp += static_cast<size_t>(j) * 3 * template_->nv;
+        if (row_ctx.jacr) row_ctx.jacr += static_cast<size_t>(j) * 3 * template_->nv;
+        if (row_ctx.out) row_ctx.out += static_cast<size_t>(j) * row_ctx.npoint;
+        c = &row_ctx;
+      }
       Guarded(t, p ? p[j] : j, op, arg,
-              hist ? hist + static_cast<size_t>(j) * arg * nstate_ : nullptr);
+              hist ? hist + static_cast<size_t>(j) * arg * nstate_ : nullptr, c);
     };
     if (pool_->size() == 1) {
       for (int j = 0; j < n; ++j) fn(0, j);

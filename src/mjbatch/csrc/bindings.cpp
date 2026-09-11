@@ -80,5 +80,16 @@ handler installed at import; installing another handler later disables it.)")
       .def("forward", &Batch::forward, "ids"_a.noconvert() = nb::none())
       .def("reset", &Batch::reset, "ids"_a.noconvert() = nb::none(), "keyframe"_a = -1,
            "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.")
+      .def("jac_site", &Batch::jac_site, "site"_a, "jacp"_a.noconvert() = nb::none(),
+           "jacr"_a.noconvert() = nb::none(), "ids"_a.noconvert() = nb::none(),
+           "mj_jacSite per selected simulation into caller-allocated (sel, 3, nv) rows; "
+           "either output may be None. Runs mj_kinematics and mj_comPos only, not "
+           "mj_forward, so bound derived fields are refreshed to kinematics level.")
+      .def("sample_hfield", &Batch::sample_hfield, "geom"_a, "body"_a,
+           "offsets"_a.noconvert(), "out"_a.noconvert(), "ids"_a.noconvert() = nb::none(),
+           "Bilinear hfield heights per selected simulation at world-frame XY offsets "
+           "around a frame body's origin, into caller-allocated (sel, npoint) rows. Runs "
+           "mj_kinematics only. All simulations sample the template's hfield; a per-sim "
+           "geom_pos moves the sampling frame.")
       .def("set_const", &Batch::set_const, "ids"_a.noconvert() = nb::none());
 }
