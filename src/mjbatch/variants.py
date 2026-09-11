@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import mujoco
 import numpy as np
@@ -29,7 +29,8 @@ _BODY_VARIANT_FIELDS = (
   "body_iquat",
 )
 _DOF_VARIANT_FIELDS = ("dof_M0", "dof_invweight0", "dof_length")
-_VARIANT_FIELDS = _GEOM_VARIANT_FIELDS + _BODY_VARIANT_FIELDS + _DOF_VARIANT_FIELDS
+_DIRECT_VARIANT_FIELDS = _BODY_VARIANT_FIELDS + _DOF_VARIANT_FIELDS
+_VARIANT_FIELDS = _GEOM_VARIANT_FIELDS + _DIRECT_VARIANT_FIELDS
 
 _LAYOUT_SCALARS = (
   "nq",
@@ -61,6 +62,16 @@ _LAYOUT_SCALARS = (
   "nuser_tendon",
   "nuser_actuator",
 )
+_ENTITY_KIND_COUNTS = (
+  ("body", "nbody"),
+  ("joint", "njnt"),
+  ("site", "nsite"),
+  ("cam", "ncam"),
+  ("light", "nlight"),
+  ("actuator", "nu"),
+  ("sensor", "nsensor"),
+  ("tendon", "ntendon"),
+)
 
 
 @dataclass(frozen=True)
@@ -71,19 +82,8 @@ class VariantPack:
   num_variants: int
   fields: Mapping[str, np.ndarray]
 
-  def field_values(self, name: str) -> np.ndarray:
-    """Return a copy of one field's ``(num_variants, ...)`` table."""
-    if name not in self.fields:
-      raise KeyError(f"unknown variant field {name!r}")
-    return self.fields[name].copy()
-
   @classmethod
-  def from_specs(
-    cls,
-    specs: Sequence[mujoco.MjSpec],
-    *,
-    slot_policy: str = "stable-name",
-  ) -> "VariantPack":
+  def from_specs(cls, specs: Sequence[mujoco.MjSpec]) -> "VariantPack":
     """Compile variants independently and merge their meshes into one model.
 
     Variants must have the same named structural layout. A canonical variant may
@@ -91,8 +91,6 @@ class VariantPack:
     slots are disabled with ``mjGEOM_NONE``, ``geom_dataid=-1``, and zero contact
     bits. Non-mesh topology and parameters must not vary.
     """
-    if slot_policy != "stable-name":
-      raise ValueError("slot_policy must be 'stable-name'")
     if not specs:
       raise ValueError("at least one variant spec is required")
 
@@ -102,18 +100,20 @@ class VariantPack:
 
     mesh_pool: dict[tuple[Any, ...], str] = {}
     for mesh in canonical_spec.meshes:
-      signature = _mesh_signature(canonical_spec, mesh)
-      mesh_pool[signature] = mesh.name
+      mesh_pool[_mesh_key(canonical_spec, mesh)] = mesh.name
 
     mesh_names_by_variant: list[dict[str, str]] = []
-    for spec in specs:
+    for variant_index, spec in enumerate(specs):
       mesh_names: dict[str, str] = {}
       for mesh in spec.meshes:
-        signature = _mesh_signature(spec, mesh)
-        pooled_name = mesh_pool.get(signature)
-        if pooled_name is None:
-          pooled_name = _add_pooled_mesh(canonical_spec, spec, mesh, mesh_pool)
-          mesh_pool[signature] = pooled_name
+        if variant_index == canonical_index:
+          pooled_name = mesh.name
+        else:
+          key = _mesh_key(spec, mesh)
+          pooled_name = mesh_pool.get(key)
+          if pooled_name is None:
+            pooled_name = _copy_mesh(canonical_spec, spec, mesh, variant_index)
+            mesh_pool[key] = pooled_name
         if mesh.name in mesh_names:
           raise ValueError(f"variant has duplicate mesh name {mesh.name!r}")
         mesh_names[mesh.name] = pooled_name
@@ -122,8 +122,6 @@ class VariantPack:
     canonical = canonical_spec.compile()
     _validate_layout(reference_models, canonical)
     geom_maps = _validate_names_and_build_geom_maps(reference_models, canonical)
-    body_maps = [np.arange(canonical.nbody, dtype=np.int32) for _ in specs]
-    dof_maps = [np.arange(canonical.nv, dtype=np.int32) for _ in specs]
     mesh_id_maps = _build_mesh_id_maps(
       reference_models,
       canonical,
@@ -144,12 +142,9 @@ class VariantPack:
           geom_maps,
           canonical,
         )
-      elif name in _BODY_VARIANT_FIELDS:
-        for variant, (reference, body_map) in enumerate(zip(reference_models, body_maps, strict=True)):
-          values[variant][body_map] = getattr(reference, name)
-      elif name in _DOF_VARIANT_FIELDS:
-        for variant, (reference, dof_map) in enumerate(zip(reference_models, dof_maps, strict=True)):
-          values[variant][dof_map] = getattr(reference, name)
+      elif name in _DIRECT_VARIANT_FIELDS:
+        for variant, reference in enumerate(reference_models):
+          values[variant] = getattr(reference, name)
       fields[name] = values
 
     dataids = fields["geom_dataid"] = np.full((len(specs), canonical.ngeom), -1, dtype=np.int32)
@@ -184,68 +179,68 @@ def _mesh_path(spec: mujoco.MjSpec, mesh: mujoco.MjsMesh) -> Path | None:
   return path.resolve()
 
 
-def _sequence(value: Iterable[Any]) -> tuple[Any, ...]:
-  return tuple(np.asarray(value).tolist())
-
-
-def _mesh_signature(spec: mujoco.MjSpec, mesh: mujoco.MjsMesh) -> tuple[Any, ...]:
+def _mesh_key(spec: mujoco.MjSpec, mesh: mujoco.MjsMesh) -> tuple[Any, ...]:
   path = _mesh_path(spec, mesh)
   content = path.read_bytes() if path is not None and path.exists() else b""
+  vector_keys = tuple(
+    (name, np.asarray(getattr(mesh, name)).tobytes())
+    for name in (
+      "refpos",
+      "refquat",
+      "scale",
+      "uservert",
+      "usernormal",
+      "usertexcoord",
+      "userface",
+      "userfacenormal",
+      "userfacetexcoord",
+    )
+  )
   return (
     mesh.content_type,
     content,
-    _sequence(mesh.refpos),
-    _sequence(mesh.refquat),
-    _sequence(mesh.scale),
+    vector_keys,
     int(mesh.inertia),
     bool(mesh.smoothnormal),
     bool(mesh.needsdf),
     int(mesh.maxhullvert),
     int(mesh.octree_maxdepth),
-    _sequence(mesh.uservert),
-    _sequence(mesh.usernormal),
-    _sequence(mesh.usertexcoord),
-    _sequence(mesh.userface),
-    _sequence(mesh.userfacenormal),
-    _sequence(mesh.userfacetexcoord),
     mesh.material,
   )
 
 
-def _add_pooled_mesh(
+def _copy_mesh(
   target: mujoco.MjSpec,
   source_spec: mujoco.MjSpec,
   source: mujoco.MjsMesh,
-  mesh_pool: Mapping[tuple[Any, ...], str],
+  variant_index: int,
 ) -> str:
   base_name = source.name or "mesh"
-  index = len(mesh_pool)
+  index = variant_index
   while True:
-    name = f"mjbatch_mesh_{index}_{base_name}"
-    if not any(mesh.name == name for mesh in target.meshes):
+    pooled_name = f"mjbatch_mesh_v{index}_{base_name}"
+    if not any(mesh.name == pooled_name for mesh in target.meshes):
       break
     index += 1
 
-  copied = target.add_mesh(name=name)
+  copied = target.add_mesh(name=pooled_name)
   path = _mesh_path(source_spec, source)
   copied.file = "" if path is None else str(path)
   copied.content_type = source.content_type
-  copied.refpos = np.asarray(source.refpos)
-  copied.refquat = np.asarray(source.refquat)
-  copied.scale = np.asarray(source.scale)
-  copied.inertia = source.inertia
-  copied.smoothnormal = source.smoothnormal
-  copied.needsdf = source.needsdf
-  copied.maxhullvert = source.maxhullvert
-  copied.octree_maxdepth = source.octree_maxdepth
-  copied.uservert = list(source.uservert)
-  copied.usernormal = list(source.usernormal)
-  copied.usertexcoord = list(source.usertexcoord)
-  copied.userface = list(source.userface)
-  copied.userfacenormal = list(source.userfacenormal)
-  copied.userfacetexcoord = list(source.userfacetexcoord)
-  copied.material = source.material
-  return name
+  for name in ("refpos", "refquat", "scale"):
+    setattr(copied, name, np.asarray(getattr(source, name)))
+  for name in ("inertia", "smoothnormal", "needsdf", "maxhullvert", "octree_maxdepth", "material"):
+    setattr(copied, name, getattr(source, name))
+  for name in (
+    "uservert",
+    "usernormal",
+    "usertexcoord",
+    "userface",
+    "userfacenormal",
+    "userfacetexcoord",
+  ):
+    setattr(copied, name, list(getattr(source, name)))
+  return pooled_name
 
 
 def _layout(model: mujoco.MjModel) -> tuple[tuple[str, int], ...]:
@@ -277,34 +272,15 @@ def _validate_names_and_build_geom_maps(
     raise ValueError("canonical geoms must have unique, non-empty names")
 
   canonical_by_kind = {
-    kind: _names(canonical, kind, getattr(canonical, count))
-    for kind, count in (
-      ("body", "nbody"),
-      ("joint", "njnt"),
-      ("site", "nsite"),
-      ("cam", "ncam"),
-      ("light", "nlight"),
-      ("actuator", "nu"),
-      ("sensor", "nsensor"),
-      ("tendon", "ntendon"),
-    )
+    kind: _names(canonical, kind, getattr(canonical, count)) for kind, count in _ENTITY_KIND_COUNTS
   }
+  count_by_kind = dict(_ENTITY_KIND_COUNTS)
   canonical_geom_ids = {name: i for i, name in enumerate(canonical_geoms)}
 
   maps: list[np.ndarray] = []
   for variant, reference in enumerate(references):
     for kind, expected in canonical_by_kind.items():
-      count = {
-        "body": "nbody",
-        "joint": "njnt",
-        "site": "nsite",
-        "cam": "ncam",
-        "light": "nlight",
-        "actuator": "nu",
-        "sensor": "nsensor",
-        "tendon": "ntendon",
-      }[kind]
-      actual = _names(reference, kind, getattr(reference, count))
+      actual = _names(reference, kind, getattr(reference, count_by_kind[kind]))
       if actual != expected:
         raise ValueError(f"variant {variant} changes {kind} names or order")
     names = _names(reference, "geom", reference.ngeom)
@@ -340,7 +316,6 @@ def _disable_missing_geom_slots(
   geom_maps: Sequence[np.ndarray],
   canonical: mujoco.MjModel,
 ) -> np.ndarray:
-  identity = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=values.dtype)
   for variant, geom_map in enumerate(geom_maps):
     present = np.zeros(canonical.ngeom, dtype=bool)
     present[geom_map] = True
@@ -354,7 +329,7 @@ def _disable_missing_geom_slots(
     elif name == "geom_rgba":
       values[variant, missing] = (0.0, 0.0, 0.0, 0.0)
     elif name == "geom_quat":
-      values[variant, missing] = identity
+      values[variant, missing] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=values.dtype)
     else:
       values[variant, missing] = 0
   return values

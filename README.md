@@ -29,41 +29,27 @@ for _ in range(1000):
   batch.step()                       # step them in parallel; qpos updates in place
 ```
 
-## Per-simulation model fields
+## Model randomization and variants
 
 `expand(field)` returns a live `(num_sims, ...)` view of a non-asset `MjModel` field.
-Rows are applied to MuJoCo before that simulation's next call. Use `set_const(ids)`
-after changing inputs such as mass or inertia; it runs `mj_setConst` per selected
-simulation and expands the derived fields that MuJoCo changed.
+Rows are applied before each selected simulation runs. `model_field_specs()` describes
+the shape, dtype, writability, and recompute dependency of every field. Declare the
+fields being written to `model_update`; like mjlab event terms, mjbatch computes the
+strongest recompute level and runs one conservative stock-MuJoCo `mj_setConst` pass.
 
 ```python
-mass = batch.expand("body_mass")
-mass[[1, 4, 7], body_id] *= 1.2
-batch.set_const(np.array([1, 4, 7]))
+from mjbatch import RecomputeLevel
+
+assert batch.model_field_specs()["body_mass"].recompute == RecomputeLevel.SET_CONST
+with batch.model_update("body_mass", "geom_friction", ids=reset_envs):
+  batch.expand("body_mass")[reset_envs, body_id] *= 1.1
+  batch.expand("geom_friction")[reset_envs, :, 0] = friction_samples
 ```
 
-Asset arrays (`mesh_*`, `hfield_*`, `tex_*`, and related large constant data) are
-shared and immutable. A model can nevertheless pool multiple meshes in one canonical
-layout and select one per simulation through `geom_dataid`:
-
-```python
-mesh_id = canonical.geom("mesh").id
-dataid = batch.expand("geom_dataid")
-dataid[tool_envs, mesh_id] = pooled_mesh_ids[tool_envs]
-```
-
-Mesh geometry also affects compiler-derived fields such as `geom_size`,
-`geom_rbound`, `geom_aabb`, `geom_pos`, `geom_quat`, `body_inertia`,
-`body_invweight0`, `body_ipos`, and `body_iquat`. Scatter those values from
-independently compiled reference models before calling `set_const`. mjbatch does
-not require the manual field scatter below to be handwritten for common mesh
-variants, but all directly pooled variants must share the same model layout.
-
-For same-layout mesh variants, `VariantPack.from_specs()` performs that construction:
-it compiles every source spec independently, pools and deduplicates meshes, aligns
-named geom slots, disables optional slots missing from a variant, and scatters the
-compiler-derived geometry and inertia fields. `Batch.from_variant_pack()` applies a
-fixed initialization-time assignment and performs the initial recompute.
+For mesh-only differences, `VariantPack.from_specs()` independently compiles each
+source spec, pools and deduplicates meshes, aligns named geom slots, disables missing
+optional slots, and scatters compiler-derived geometry and inertia fields.
+`Batch.from_variant_pack()` applies its fixed assignment and initial recompute.
 
 ```python
 from mjbatch import Batch, VariantPack
@@ -72,16 +58,9 @@ pack = VariantPack.from_specs([tool_spec_0, tool_spec_1, tool_spec_2])
 batch = Batch.from_variant_pack(pack, num_sims, np.arange(num_sims) % 3)
 ```
 
-Variants must use the same named structural layout and differ only in mesh assets or
-the presence of optional mesh-geom slots. Different topologies require the separate
-topology-group API rather than silent padding.
-
-When layouts cannot be canonicalized, put each topology in its own `Batch` and route
-global ids through `ModelAffineBatch`. Assignments are fixed, validated to cover every
-global id exactly once, and exposed as immutable per-group ids. `step`, `forward`,
-`reset`, `set_const`, and `model_update` accept global ids; state and model fields stay
-on each `TopologyGroup` because their shapes can differ. Global `history` is rejected
-rather than padding heterogeneous state rows.
+Truly incompatible topologies are not silently padded. Put each one in its own `Batch`
+and route fixed global assignments through `ModelAffineBatch`. State and field views
+remain on each `TopologyGroup`; global `history` is rejected.
 
 ```python
 from mjbatch import ModelAffineBatch
@@ -91,29 +70,10 @@ sharded.step(np.array([0, 3, 4]))
 state_a, state_b = sharded["one_joint"].state, sharded["two_joint"].state
 ```
 
-A reproducible CPU benchmark for cold start, RSS, stepping, and model-field updates is
-available with:
+Reproducible cold-start, RSS, stepping, and model-field-update measurements:
 
 ```bash
 uv run python benchmarks/topology_groups.py --num-sims 512 --threads 4
-```
-
-`model_field_specs()` describes every field accepted by `expand`: its template shape,
-native dtype, whether it is writable or pooled asset data, and which derived constants
-must be refreshed after it changes. `model_update(ids)` is a transaction over those
-fields. It compares only the selected rows and, on exit, invokes the strongest required
-recompute once. Writes made to unselected rows are restored. Writing only fields with
-`RecomputeLevel.NONE` performs no recompute; higher levels currently use one
-conservative full `mj_setConst` pass.
-
-```python
-from mjbatch import RecomputeLevel
-
-specs = batch.model_field_specs()
-assert specs["body_mass"].recompute == RecomputeLevel.SET_CONST
-with batch.model_update(reset_envs):
-  batch.expand("body_mass")[reset_envs, body_id] *= 1.1
-  batch.expand("geom_friction")[reset_envs, :, 0] = friction_samples
 ```
 
 ## Examples

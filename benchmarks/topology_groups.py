@@ -110,7 +110,7 @@ def time_field_update(sharded: ModelAffineBatch, rng: np.random.Generator, calls
   }
   total_values = sum(array.size for array in values.values())
   for _ in range(3):
-    with sharded.model_update():
+    with sharded.model_update("geom_friction"):
       for group in sharded.groups:
         group.expand("geom_friction")[:] = values[group.name]
   samples = []
@@ -118,7 +118,7 @@ def time_field_update(sharded: ModelAffineBatch, rng: np.random.Generator, calls
     start = time.perf_counter_ns()
     for call in range(calls):
       scale = 0.5 + ((call % 2) * 0.1)
-      with sharded.model_update():
+      with sharded.model_update("geom_friction"):
         for group in sharded.groups:
           group.expand("geom_friction")[:] = values[group.name] * scale
     samples.append((time.perf_counter_ns() - start) / 1e6 / calls)
