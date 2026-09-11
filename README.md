@@ -10,7 +10,8 @@ Features include:
 * C++ thread pool execution, with the GIL released;
 * Live array access to simulation state and controls across the batch, with `bind` for MjData fields;
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
-* Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield`.
+* Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield` (world/yaw/body grid alignment, height or clearance output).
+* Per-substep control from Python with `step(..., callback=...)`, plus warning-based early stop via `stop_on_warning` and per-sim substep counts via `steps_done`.
 * Optional per-worker CPU pinning on Linux, with `cpu_ids` binding pool worker `i` to `cpu_ids[i]`.
 
 For example:
@@ -27,6 +28,13 @@ for _ in range(1000):
   ctrl[:] = policy(qpos)             # your controller, all 4096 at once
   batch.step()                       # step them in parallel; qpos updates in place
 ```
+
+`sample_hfield` samples a shared heightfield at XY offsets around a body origin.
+`alignment="yaw"` rotates the sampling grid by the hfield geom's yaw about world z
+(and `"body"` by its full rotation), so a per-sim `geom_quat` rotates each
+simulation's scan pattern. With `output="clearance"` each point returns the signed
+distance along the geom's z-axis from the hfield surface to the sample point taken
+at the frame body's height — `bpos_z - gpos_z - height` for an unrotated geom.
 
 ## Examples
 
