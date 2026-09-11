@@ -10,6 +10,7 @@ Features include:
 * C++ thread pool execution, with the GIL released;
 * Live array access to simulation state and controls across the batch, with `bind` for MjData fields;
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
+* Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield`.
 
 For example:
 
