@@ -91,7 +91,7 @@ class Batch:
 
     def sample_hfield(self, geom: int, body: int, offsets: NDArray, out: NDArray, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, alignment: str = 'world', output: str = 'height') -> None:
         """
-        Bilinear hfield sampling per selected simulation at XY offsets around a frame body's origin, into caller-allocated (sel, npoint) rows. alignment rotates the sampling grid: "world" keeps offsets in world axes, "yaw" rotates them by the geom's yaw about world z, "body" by the geom's full rotation. output: "height" returns the hfield elevation at each point; "clearance" returns the signed distance along the geom z-axis from the hfield surface to the query point (the sample point at the frame body's height, so bpos_z - gpos_z - height for an unrotated geom). Runs mj_kinematics only. All simulations sample the template's hfield; a per-sim geom_pos or geom_quat moves the sampling frame.
+        Bilinear hfield sampling per selected simulation at XY offsets around a frame body's origin, into caller-allocated (sel, npoint) rows. alignment rotates the sampling grid: "world" keeps offsets in world axes, "yaw" rotates them by the frame body's yaw about world z, "body" by the frame body's full rotation. output: "height" returns the world z of the sampled hfield surface (the local elevation for an unrotated geom at the origin); "clearance" returns frame_z - sampled_world_z, the world-z clearance of the body origin above the surface. Runs mj_kinematics only. All simulations sample the template's hfield; a per-sim geom_pos or geom_quat moves the sampling frame.
         """
 
     def set_const(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...

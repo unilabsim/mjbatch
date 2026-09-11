@@ -292,7 +292,9 @@ struct Scalars {
 };
 
 // SampleHfield grid alignment: offsets stay in world axes (World), rotate with
-// the geom's yaw about world z (Yaw), or with the geom's full rotation (Body).
+// the frame body's yaw about world z (Yaw), or with the frame body's full
+// rotation (Body).  This is the mujoco_uni BatchEnvPool.sample_hfield_height
+// convention, which this op replaces.
 enum class HfieldAlign { World, Yaw, Body };
 
 // Per-call context for the query ops (JacSite, SampleHfield): outputs are
@@ -330,16 +332,17 @@ struct CallbackCtx {
 
 // Bilinear sampling of one hfield geom at XY offsets from a frame body's origin.
 // The offsets form a sampling grid rotated per ctx.align: World keeps them in
-// world axes, Yaw rotates them by the geom's yaw about world z (extracted from
-// geom_xmat), Body by the geom's full rotation. Sample points are transformed
-// into the geom's local frame (its pose comes from the sim's mjData, so per-sim
-// geom_pos/geom_quat apply); the hfield grid itself is the model's, shared by
-// all sims. The grid mapping and clamping match MuJoCo's hfield contact
-// convention for the XY extent [-size[0], size[0]] x [-size[1], size[1]].
-// output=height returns local heights (interp * size[2]); output=clearance
-// returns the signed distance along the geom z-axis from the hfield surface to
-// the query point, which is the sample point taken at the frame body's height
-// (so bpos_z - gpos_z - height for an unrotated geom).
+// world axes, Yaw rotates them by the frame body's yaw about world z (extracted
+// from xmat), Body by the frame body's full rotation. Sample points are taken
+// in the plane through the geom center, then transformed into the geom's local
+// frame (its pose comes from the sim's mjData, so per-sim geom_pos/geom_quat
+// apply); the hfield grid itself is the model's, shared by all sims. The grid
+// mapping and clamping match MuJoCo's hfield contact convention for the XY
+// extent [-size[0], size[0]] x [-size[1], size[1]].
+// output=height returns the world z of the sampled surface point (for an
+// unrotated geom at the origin this is the local elevation interp * size[2]);
+// output=clearance returns frame_z - sampled_world_z, the world-z clearance of
+// the body origin above the sampled surface.
 
 inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx) {
   int hfield = m->geom_dataid[ctx.geom];
@@ -349,26 +352,26 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
   const mjtNum* gpos = d->geom_xpos + 3 * ctx.geom;
   const mjtNum* gmat = d->geom_xmat + 9 * ctx.geom;
   const mjtNum* bpos = d->xpos + 3 * ctx.body;
-  mjtNum cyaw = 1.0, syaw = 0.0;  // geom yaw about world z, for HfieldAlign::Yaw
+  const mjtNum* bmat = d->xmat + 9 * ctx.body;
+  mjtNum cyaw = 1.0, syaw = 0.0;  // frame body yaw about world z, for HfieldAlign::Yaw
   if (ctx.align == HfieldAlign::Yaw) {
-    cyaw = mju_cos(mju_atan2(gmat[1], gmat[0]));
-    syaw = mju_sin(mju_atan2(gmat[1], gmat[0]));
+    // xmat is row-major world = R * body; the body x-axis in world is column 0.
+    cyaw = mju_cos(mju_atan2(bmat[3], bmat[0]));
+    syaw = mju_sin(mju_atan2(bmat[3], bmat[0]));
   }
   for (int k = 0; k < ctx.npoint; ++k) {
     mjtNum ox = ctx.offsets[2 * k], oy = ctx.offsets[2 * k + 1];
-    mjtNum rx = ox, ry = oy, rz = 0.0;
+    mjtNum rx = ox, ry = oy;
     if (ctx.align == HfieldAlign::Yaw) {
       rx = cyaw * ox - syaw * oy;
       ry = syaw * ox + cyaw * oy;
     } else if (ctx.align == HfieldAlign::Body) {
-      rx = gmat[0] * ox + gmat[3] * oy;
-      ry = gmat[1] * ox + gmat[4] * oy;
-      rz = gmat[2] * ox + gmat[5] * oy;
+      rx = bmat[0] * ox + bmat[1] * oy;
+      ry = bmat[3] * ox + bmat[4] * oy;
     }
-    // World and Yaw sample in the geom-center plane; Body tilts the grid, so
-    // the query point keeps the body origin's height plus the rotated offset.
-    mjtNum wp[3] = {bpos[0] + rx, bpos[1] + ry,
-                    ctx.align == HfieldAlign::Body ? bpos[2] + rz : gpos[2]};
+    // All alignments sample in the geom-center plane; Body still tilts the
+    // grid's xy mapping through the full body rotation.
+    mjtNum wp[3] = {bpos[0] + rx, bpos[1] + ry, gpos[2]};
     mjtNum rel[3], lp[3];
     mju_sub3(rel, wp, gpos);
     mju_mulMatTVec(lp, gmat, rel, 3, 3);
@@ -384,14 +387,12 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
                (1 - sx) * sy * data[iy1 * ncol + ix] +
                sx * sy * data[iy1 * ncol + ix1];
     h *= hsize[2];
+    // World z of the surface point above the sample: gpos + gmat @ (lp0, lp1, h).
+    mjtNum surfz = gpos[2] + gmat[6] * lp[0] + gmat[7] * lp[1] + gmat[8] * h;
     if (ctx.clearance) {
-      // lp[2] is the geom-space z of wp; for World/Yaw the query point sits at
-      // the body origin's height, adding gmat[8] * (bpos_z - gpos_z).
-      mjtNum qz = lp[2];
-      if (ctx.align != HfieldAlign::Body) qz += gmat[8] * (bpos[2] - gpos[2]);
-      ctx.out[k] = qz - h;
+      ctx.out[k] = bpos[2] - surfz;
     } else {
-      ctx.out[k] = h;
+      ctx.out[k] = surfz;
     }
   }
 }
@@ -559,11 +560,10 @@ class Batch {
   // body's origin, into caller-allocated (sel, npoint) rows. Runs kinematics
   // only. All sims sample the template's hfield; a per-sim geom_pos/geom_quat
   // moves the sampling frame. alignment rotates the sampling grid: "world"
-  // keeps offsets in world axes, "yaw" rotates them by the geom's yaw about
-  // world z, "body" by the geom's full rotation. output: "height" returns the
-  // hfield elevation at each point; "clearance" returns the signed distance
-  // along the geom z-axis from the hfield surface to the query point (the
-  // sample point at the frame body's height).
+  // keeps offsets in world axes, "yaw" rotates them by the frame body's yaw
+  // about world z, "body" by the frame body's full rotation. output: "height"
+  // returns the world z of the sampled hfield surface; "clearance" returns
+  // frame_z - sampled_world_z.
   void sample_hfield(int geom, int body, const nb::ndarray<>& offsets, nb::ndarray<> out,
                      std::optional<Ids> ids, const std::string& alignment,
                      const std::string& output) {
