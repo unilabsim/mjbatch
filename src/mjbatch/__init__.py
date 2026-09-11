@@ -116,14 +116,13 @@ class Batch(_Batch):
     """Bilinear hfield sampling at XY offsets around a body's origin.
 
     offsets: (npoint, 2), in the sampling grid's frame. alignment rotates the
-    grid: "world" keeps offsets in world axes, "yaw" rotates them by the hfield
-    geom's yaw about world z, "body" by the geom's full rotation. output:
-    "height" returns the hfield elevation at each point; "clearance" returns
-    the signed distance along the geom z-axis from the hfield surface to the
-    sample point at the body's height (bpos_z - gpos_z - height for an
-    unrotated geom). Returns (nsel, npoint). All simulations sample the
-    template's hfield; a per-sim geom_pos/geom_quat moves the sampling frame.
-    Runs kinematics only, not mj_forward."""
+    grid: "world" keeps offsets in world axes, "yaw" rotates them by the frame
+    body's yaw about world z, "body" by the body's full rotation. output:
+    "height" returns the world z of the sampled hfield surface (the local
+    elevation for an unrotated geom at the origin); "clearance" returns
+    frame_z - sampled_world_z. Returns (nsel, npoint). All simulations sample
+    the template's hfield; a per-sim geom_pos/geom_quat moves the sampling
+    frame. Runs kinematics only, not mj_forward."""
     g = self.model.geom(geom).id
     b = self.model.body(body).id
     offsets = np.ascontiguousarray(offsets, dtype=np.float64)
