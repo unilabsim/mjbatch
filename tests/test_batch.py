@@ -10,7 +10,7 @@ import mujoco
 import numpy as np
 import pytest
 
-from mjbatch import Batch, ModelFieldSpec, RecomputeLevel
+from mjbatch import Batch, ModelAffineBatch, ModelFieldSpec, RecomputeLevel
 from mjbatch._bindings import Batch as RawBatch
 from mjbatch.variants import VariantPack
 
@@ -370,6 +370,64 @@ def test_variant_pack_validates_slots_layout_and_assignment(tmp_path):
   pack = VariantPack.from_specs([spec, spec])
   with pytest.raises(ValueError, match="assignment entries"):
     Batch.from_variant_pack(pack, N, np.full(N, 2))
+
+
+def test_model_affine_batch_routes_global_ids(model):
+  other = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  group_batch, other_batch = Batch(model, N // 2), Batch(other, N // 2)
+  control_batch, other_control = Batch(model, N // 2), Batch(other, N // 2)
+  sharded = ModelAffineBatch(
+    [group_batch, other_batch],
+    names=["cart", "lockstep"],
+  )
+  assert sharded.num_sims == N
+  assert sharded.num_groups == 2
+  np.testing.assert_array_equal(sharded["cart"].global_ids, np.arange(N // 2))
+  np.testing.assert_array_equal(sharded.group("lockstep").global_ids, np.arange(N // 2, N))
+  assert sharded["cart"].nstate != sharded["lockstep"].nstate
+
+  ids = np.array([0, 2, 5, 7])
+  sharded.step(ids)
+  control_batch.step(np.array([0, 2]))
+  other_control.step(np.array([1, 3]))
+  np.testing.assert_array_equal(sharded["cart"].state, control_batch.bind("state"))
+  np.testing.assert_array_equal(sharded["lockstep"].state, other_control.bind("state"))
+
+  sharded.reset(ids, keyframe=0)
+  control_batch.reset(np.array([0, 2]), keyframe=0)
+  other_control.reset(np.array([1, 3]), keyframe=0)
+  np.testing.assert_array_equal(sharded["cart"].state, control_batch.bind("state"))
+  np.testing.assert_array_equal(sharded["lockstep"].state, other_control.bind("state"))
+
+  with pytest.raises(ValueError, match="collect state from each group"):
+    sharded.step(history=np.empty((0, 1, 1)))
+
+
+def test_model_affine_batch_model_update_and_validation(model):
+  other = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  batches = [Batch(model, N // 2), Batch(other, N // 2)]
+  sharded = ModelAffineBatch.from_batches(batches)
+  ids = np.array([0, 2, 5, 7])
+  with sharded.model_update(ids):
+    for group in sharded.groups:
+      local_ids = np.searchsorted(group.global_ids, ids[np.isin(ids, group.global_ids)])
+      group.expand("body_mass")[local_ids, 1] = 2.0
+
+  for group in sharded.groups:
+    subtree = group.expand("body_subtreemass")
+    local_ids = np.searchsorted(group.global_ids, ids[np.isin(ids, group.global_ids)])
+    np.testing.assert_array_equal(subtree[local_ids, 1], 2.1)
+    unselected = np.setdiff1d(np.arange(group.num_sims), local_ids)
+    np.testing.assert_array_equal(subtree[unselected, 1], group.batch.model.body_subtreemass[1])
+
+  with pytest.raises(ValueError, match="cover every global id"):
+    ModelAffineBatch(batches, [np.arange(N // 2), np.arange(N // 2)])
+  with pytest.raises(ValueError, match="names must be unique"):
+    ModelAffineBatch(batches, names=["same", "same"])
+  with pytest.raises(ValueError, match="ids must be sorted"):
+    sharded.step(np.array([2, 0]))
+  with pytest.raises(ValueError, match="keyframe out of range"):
+    sharded.reset(keyframe=99)
 
 
 def test_sleep_is_rejected():

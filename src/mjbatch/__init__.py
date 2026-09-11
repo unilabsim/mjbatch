@@ -11,6 +11,8 @@ import mujoco
 import numpy as np
 
 from mjbatch._bindings import Batch as _Batch
+from mjbatch.groups import ModelAffineBatch as ModelAffineBatch
+from mjbatch.groups import TopologyGroup as TopologyGroup
 from mjbatch.variants import VariantPack
 
 _QPOS_WIDTH = {0: 7, 1: 4, 2: 1, 3: 1}  # by mjtJoint: free, ball, slide, hinge

@@ -11,6 +11,7 @@ Features include:
 * Live array access to simulation state and controls across the batch, with `bind` for MjData fields;
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
 * Same-layout compiler-coherent mesh variants, with `VariantPack.from_specs()` and `Batch.from_variant_pack()`.
+* Explicit topology-affine groups, with `ModelAffineBatch` routing global ids to incompatible layouts.
 * Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield`.
 
 For example:
@@ -74,6 +75,28 @@ batch = Batch.from_variant_pack(pack, num_sims, np.arange(num_sims) % 3)
 Variants must use the same named structural layout and differ only in mesh assets or
 the presence of optional mesh-geom slots. Different topologies require the separate
 topology-group API rather than silent padding.
+
+When layouts cannot be canonicalized, put each topology in its own `Batch` and route
+global ids through `ModelAffineBatch`. Assignments are fixed, validated to cover every
+global id exactly once, and exposed as immutable per-group ids. `step`, `forward`,
+`reset`, `set_const`, and `model_update` accept global ids; state and model fields stay
+on each `TopologyGroup` because their shapes can differ. Global `history` is rejected
+rather than padding heterogeneous state rows.
+
+```python
+from mjbatch import ModelAffineBatch
+
+sharded = ModelAffineBatch([batch_a, batch_b], names=["one_joint", "two_joint"])
+sharded.step(np.array([0, 3, 4]))
+state_a, state_b = sharded["one_joint"].state, sharded["two_joint"].state
+```
+
+A reproducible CPU benchmark for cold start, RSS, stepping, and model-field updates is
+available with:
+
+```bash
+uv run python benchmarks/topology_groups.py --num-sims 512 --threads 4
+```
 
 `model_field_specs()` describes every field accepted by `expand`: its template shape,
 native dtype, whether it is writable or pooled asset data, and which derived constants
