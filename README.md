@@ -10,6 +10,7 @@ Features include:
 * C++ thread pool execution, with the GIL released;
 * Live array access to simulation state and controls across the batch, with `bind` for MjData fields;
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
+* Same-layout compiler-coherent mesh variants, with `VariantPack.from_specs()` and `Batch.from_variant_pack()`.
 * Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield`.
 
 For example:
@@ -54,8 +55,25 @@ Mesh geometry also affects compiler-derived fields such as `geom_size`,
 `geom_rbound`, `geom_aabb`, `geom_pos`, `geom_quat`, `body_inertia`,
 `body_invweight0`, `body_ipos`, and `body_iquat`. Scatter those values from
 independently compiled reference models before calling `set_const`. mjbatch does
-not yet construct or deduplicate the canonical model automatically; all pooled
-variants must share the same model layout.
+not require the manual field scatter below to be handwritten for common mesh
+variants, but all directly pooled variants must share the same model layout.
+
+For same-layout mesh variants, `VariantPack.from_specs()` performs that construction:
+it compiles every source spec independently, pools and deduplicates meshes, aligns
+named geom slots, disables optional slots missing from a variant, and scatters the
+compiler-derived geometry and inertia fields. `Batch.from_variant_pack()` applies a
+fixed initialization-time assignment and performs the initial recompute.
+
+```python
+from mjbatch import Batch, VariantPack
+
+pack = VariantPack.from_specs([tool_spec_0, tool_spec_1, tool_spec_2])
+batch = Batch.from_variant_pack(pack, num_sims, np.arange(num_sims) % 3)
+```
+
+Variants must use the same named structural layout and differ only in mesh assets or
+the presence of optional mesh-geom slots. Different topologies require the separate
+topology-group API rather than silent padding.
 
 `model_field_specs()` describes every field accepted by `expand`: its template shape,
 native dtype, whether it is writable or pooled asset data, and which derived constants

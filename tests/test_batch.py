@@ -12,6 +12,7 @@ import pytest
 
 from mjbatch import Batch, ModelFieldSpec, RecomputeLevel
 from mjbatch._bindings import Batch as RawBatch
+from mjbatch.variants import VariantPack
 
 XML = """
 <mujoco>
@@ -46,6 +47,15 @@ XML = """
 </mujoco>
 """
 N = 8
+TETRAHEDRON_OBJ = """v 0 0 0
+v 1 0 0
+v 0 1 0
+v 0 0 1
+f 1 3 2
+f 1 2 4
+f 1 4 3
+f 2 3 4
+"""
 
 # Activation dynamics, a mocap weld, a keyframe, and sensors that set mjData's
 # lazy-evaluation flags (accelerometer, subtreelinvel).
@@ -171,21 +181,7 @@ def test_mesh_pool_geom_dataid_matches_reference_models(tmp_path, num_threads):
   while geom_dataid and non-asset model fields become per-simulation rows.
   """
   obj_path = tmp_path / "tetrahedron.obj"
-  obj_path.write_text(
-    "\n".join(
-      [
-        "v 0 0 0",
-        "v 1 0 0",
-        "v 0 1 0",
-        "v 0 0 1",
-        "f 1 3 2",
-        "f 1 2 4",
-        "f 1 4 3",
-        "f 2 3 4",
-        "",
-      ]
-    )
-  )
+  obj_path.write_text(TETRAHEDRON_OBJ)
 
   def compile_model(assets: str) -> mujoco.MjModel:
     xml = f"""
@@ -251,6 +247,129 @@ def test_mesh_pool_geom_dataid_matches_reference_models(tmp_path, num_threads):
     mujoco.mj_getState(reference, data, expected_state, mujoco.mjtState.mjSTATE_INTEGRATION)
     rows = np.flatnonzero(expected_variants == i)
     np.testing.assert_array_equal(state[rows], np.tile(expected_state, (len(rows), 1)))
+
+
+def test_variant_pack_matches_independently_compiled_references(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def make_spec(scale_a: str, scale_b: str, *, include_b: bool = True):
+    meshes = f'<mesh name="a" file="{obj_path}" scale="{scale_a}"/>'
+    if include_b:
+      meshes += f'<mesh name="b" file="{obj_path}" scale="{scale_b}"/>'
+    geoms = '<geom name="a" type="mesh" mesh="a" mass="1"/>'
+    if include_b:
+      geoms += '<geom name="b" type="mesh" mesh="b" mass="1"/>'
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <option timestep="0.002"/>
+  <asset>{meshes}</asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 .1"/>
+    <body name="body" pos=".01 .02 .8">
+      <freejoint name="free"/>
+      {geoms}
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    )
+
+  specs = [
+    make_spec("1 1 1", "1 1 1"),
+    make_spec(".7 .8 1.2", ".9 .9 .9"),
+    make_spec(".5 .6 .7", "1 1 1", include_b=False),
+  ]
+  pack = VariantPack.from_specs(specs)
+  assert pack.num_variants == 3
+  assert pack.model.nmesh == 5
+  assert pack.model.ngeom == 3
+  dataids = pack.fields["geom_dataid"]
+  missing = pack.model.geom("b").id
+  assert np.take(dataids, [1, 2, 4, 5, 7]).min() >= 0
+  assert dataids[0, 0] == -1
+  assert dataids[2, missing] == -1
+  assert pack.fields["geom_type"][2, missing] == mujoco.mjtGeom.mjGEOM_NONE
+  assert pack.fields["geom_contype"][2, missing] == 0
+  assert pack.fields["geom_conaffinity"][2, missing] == 0
+  assert pack.fields["geom_size"][2, missing].shape == (3,)
+  np.testing.assert_array_equal(pack.fields["geom_size"][2, missing], 0.0)
+
+  assignment = np.arange(N) % 3
+  batch = Batch.from_variant_pack(pack, N, assignment, num_threads=3)
+  np.testing.assert_array_equal(batch.variant_assignment, assignment)
+  state = batch.bind("state")
+  batch.step(nstep=25)
+  for variant, spec in enumerate(specs):
+    reference = spec.compile()
+    data = mujoco.MjData(reference)
+    for _ in range(25):
+      mujoco.mj_step(reference, data)
+    expected = np.empty(batch.nstate)
+    mujoco.mj_getState(reference, data, expected, mujoco.mjtState.mjSTATE_INTEGRATION)
+    rows = np.flatnonzero(assignment == variant)
+    np.testing.assert_array_equal(state[rows], np.tile(expected, (len(rows), 1)))
+
+
+def test_variant_pack_deduplicates_identical_meshes(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+  spec = mujoco.MjSpec.from_string(
+    f"""
+<mujoco>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody><body><freejoint name="free"/><geom name="mesh" type="mesh" mesh="mesh"/></body></worldbody>
+</mujoco>
+"""
+  )
+  pack = VariantPack.from_specs([spec, spec])
+  assert pack.num_variants == 2
+  assert pack.model.nmesh == 1
+  np.testing.assert_array_equal(pack.fields["geom_dataid"], np.zeros((2, 1), dtype=np.int32))
+  with pytest.raises(ValueError, match="read-only"):
+    pack.fields["geom_dataid"][0, 0] = -1
+  writable_copy = pack.field_values("geom_dataid")
+  writable_copy[0, 0] = -1
+  assert pack.fields["geom_dataid"][0, 0] == 0
+
+
+def test_variant_pack_validates_slots_layout_and_assignment(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+  spec = mujoco.MjSpec.from_string(
+    f"""
+<mujoco>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody>
+    <body><freejoint name="free"/><geom name="mesh" type="mesh" mesh="mesh"/></body>
+  </worldbody>
+</mujoco>
+"""
+  )
+  with pytest.raises(ValueError, match="slot_policy"):
+    VariantPack.from_specs([spec], slot_policy="ordinal")
+
+  changed_layout = mujoco.MjSpec.from_string(
+    f"""
+<mujoco>
+      <asset><mesh name="mesh" file="{obj_path}"/></asset>
+      <worldbody>
+        <site name="extra"/>
+        <body>
+          <freejoint name="free"/>
+          <geom name="mesh" type="mesh" mesh="mesh"/>
+        </body>
+      </worldbody>
+</mujoco>
+"""
+  )
+  with pytest.raises(ValueError, match="changes layout field"):
+    VariantPack.from_specs([spec, changed_layout])
+
+  pack = VariantPack.from_specs([spec, spec])
+  with pytest.raises(ValueError, match="assignment entries"):
+    Batch.from_variant_pack(pack, N, np.full(N, 2))
 
 
 def test_sleep_is_rejected():
