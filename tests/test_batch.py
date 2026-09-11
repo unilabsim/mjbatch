@@ -4,12 +4,14 @@ import copy
 import subprocess
 import sys
 import threading
+from typing import cast
 
 import mujoco
 import numpy as np
 import pytest
 
-from mjbatch import Batch
+from mjbatch import Batch, ModelFieldSpec, RecomputeLevel
+from mjbatch._bindings import Batch as RawBatch
 
 XML = """
 <mujoco>
@@ -315,6 +317,87 @@ def test_expanded_option_seeds_from_the_template(model):
     b.bind("ctrl")[:, 0] = 1.0
     b.step(nstep=20)
   np.testing.assert_array_equal(batch.bind("state"), ref.bind("state"))
+
+
+def test_model_field_specs_describe_the_contract(model):
+  specs = Batch(model, N).model_field_specs()
+
+  assert specs["body_mass"].shape == (model.nbody,)
+  assert specs["body_mass"].dtype == np.dtype(np.float64)
+  assert specs["body_mass"].writable
+  assert not specs["body_mass"].asset
+  assert specs["body_mass"].recompute == RecomputeLevel.SET_CONST
+  assert specs["body_mass"].derived_fields == (
+    "body_subtreemass",
+    "dof_invweight0",
+    "body_invweight0",
+    "tendon_length0",
+    "tendon_invweight0",
+    "actuator_acc0",
+  )
+
+  assert specs["body_gravcomp"].recompute == RecomputeLevel.SET_CONST_FIXED
+  assert specs["qpos0"].recompute == RecomputeLevel.SET_CONST_0
+  assert specs["geom_friction"].recompute == RecomputeLevel.NONE
+  assert specs["timestep"].shape == ()
+  assert specs["timestep"].dtype == np.dtype(np.float64)
+  assert specs["integrator"].dtype == np.dtype(np.int32)
+  assert specs["gravity"].shape == (3,)
+
+  assert specs["mesh_vert"].asset
+  assert not specs["mesh_vert"].writable
+  assert not specs["body_parentid"].writable
+  with pytest.raises(TypeError):
+    cast(dict[str, ModelFieldSpec], specs)["new_field"] = specs["body_mass"]
+
+
+def test_model_update_recomputes_selected_rows_once(model, monkeypatch):
+  batch = Batch(model, N, num_threads=2)
+  pole = model.body("pole").id
+  ids = np.array([1, 4])
+  calls: list[np.ndarray | None] = []
+  raw_set_const = RawBatch.set_const
+
+  def counting_set_const(raw_batch: RawBatch, ids: np.ndarray | None = None) -> None:
+    calls.append(None if ids is None else ids.copy())
+    raw_set_const(raw_batch, ids)
+
+  monkeypatch.setattr(RawBatch, "set_const", counting_set_const)
+  with batch.model_update(ids):
+    batch.expand("body_mass")[ids, pole] = 2.0
+    batch.expand("geom_friction")[ids, :, 0] = 0.7
+  assert len(calls) == 1
+  np.testing.assert_array_equal(calls[0], ids)
+
+  subtree = batch.expand("body_subtreemass")
+  np.testing.assert_array_equal(subtree[ids, pole], 2.0)
+  np.testing.assert_array_equal(
+    subtree[np.setdiff1d(np.arange(N), ids), pole],
+    model.body_subtreemass[pole],
+  )
+  expected_mass = batch.expand("body_mass").copy()
+
+  with batch.model_update(ids):
+    batch.expand("geom_friction")[ids, :, 1] = 0.8
+  assert len(calls) == 1
+
+  with batch.model_update(np.array([], dtype=np.int32)):
+    batch.expand("body_mass")[:, pole] = 3.0
+  assert len(calls) == 1
+  np.testing.assert_array_equal(batch.expand("body_mass"), expected_mass)
+
+
+def test_model_update_is_transactional_and_fail_closed(model):
+  batch = Batch(model, N)
+  with pytest.raises(ValueError, match="read-only structural data"):
+    batch.expand("body_parentid")
+  with pytest.raises(RuntimeError, match="cannot be nested"):
+    with batch.model_update():
+      with batch.model_update():
+        pass
+  with pytest.raises(RuntimeError, match="after model_update exits"):
+    with batch.model_update():
+      batch.set_const()
 
 
 def test_option_is_untouched_by_set_const(model):

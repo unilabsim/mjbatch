@@ -57,6 +57,24 @@ independently compiled reference models before calling `set_const`. mjbatch does
 not yet construct or deduplicate the canonical model automatically; all pooled
 variants must share the same model layout.
 
+`model_field_specs()` describes every field accepted by `expand`: its template shape,
+native dtype, whether it is writable or pooled asset data, and which derived constants
+must be refreshed after it changes. `model_update(ids)` is a transaction over those
+fields. It compares only the selected rows and, on exit, invokes the strongest required
+recompute once. Writes made to unselected rows are restored. Writing only fields with
+`RecomputeLevel.NONE` performs no recompute; higher levels currently use one
+conservative full `mj_setConst` pass.
+
+```python
+from mjbatch import RecomputeLevel
+
+specs = batch.model_field_specs()
+assert specs["body_mass"].recompute == RecomputeLevel.SET_CONST
+with batch.model_update(reset_envs):
+  batch.expand("body_mass")[reset_envs, body_id] *= 1.1
+  batch.expand("geom_friction")[reset_envs, :, 0] = friction_samples
+```
+
 ## Examples
 
 We showcase a range of applications built using `mjbatch`: RL, MPC, SysID, and hardware
