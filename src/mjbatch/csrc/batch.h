@@ -27,6 +27,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef __linux__
+#include <sched.h>
+#endif
+
 #include "threadpool.h"
 
 namespace nb = nanobind;
@@ -35,6 +39,61 @@ namespace nb = nanobind;
 // core runs two threads at 1.3-1.5x the throughput of one (measured on a 7960X).
 inline int DefaultThreadCount() {
   return std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+}
+
+// Resolves the worker count and builds the pool. An explicit cpu_ids pins
+// worker i to cpu_ids[i] (Linux only), so the list must be non-empty, unique,
+// within the process's sched_getaffinity mask, and its length fixes the worker
+// count: it must equal num_threads, or set it when num_threads <= 0.
+inline std::unique_ptr<ThreadPool> MakePool(int num_threads, int num_sims,
+                                            std::optional<std::vector<int>> cpu_ids) {
+  std::vector<int> pin;
+  if (cpu_ids) {
+#ifdef __linux__
+    pin = std::move(*cpu_ids);
+    if (pin.empty()) throw nb::value_error("cpu_ids must be non-empty");
+    for (int id : pin) {
+      if (id < 0) throw nb::value_error("cpu_ids entries must be >= 0");
+    }
+    if (std::set<int>(pin.begin(), pin.end()).size() != pin.size()) {
+      throw nb::value_error("cpu_ids entries must be unique");
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+      throw std::runtime_error("sched_getaffinity failed");
+    }
+    std::string bad;
+    for (int id : pin) {
+      if (id >= CPU_SETSIZE || !CPU_ISSET(id, &allowed)) {
+        if (!bad.empty()) bad += ", ";
+        bad += std::to_string(id);
+      }
+    }
+    if (!bad.empty()) {
+      throw nb::value_error(("cpu_ids [" + bad + "] are not available to this process").c_str());
+    }
+    if (num_threads <= 0) num_threads = static_cast<int>(pin.size());
+    if (num_threads != static_cast<int>(pin.size())) {
+      throw nb::value_error(("cpu_ids length (" + std::to_string(pin.size()) +
+                             ") must equal num_threads (" + std::to_string(num_threads) + ")")
+                                .c_str());
+    }
+#else
+    throw nb::value_error("cpu_ids pinning is only supported on Linux");
+#endif
+  }
+  if (num_threads <= 0) num_threads = DefaultThreadCount();
+  // With pins the pool is exactly len(cpu_ids) workers so worker i always pairs
+  // with cpu_ids[i]; without, the pool is capped at num_sims.
+  int size = pin.empty() ? std::max(1, std::min(num_threads, num_sims)) : num_threads;
+  auto pool = std::make_unique<ThreadPool>(size, std::move(pin));
+  if (int err = pool->PinError()) {
+    throw nb::value_error(("failed to pin a worker thread to the requested cpu_ids (error " +
+                           std::to_string(err) + ")")
+                              .c_str());
+  }
+  return pool;
 }
 
 enum class Elem { Num, Float, Int, Byte, Bool, Other };
@@ -297,7 +356,8 @@ class Batch {
   enum class Op { Step, Forward, Reset, SetConst, JacSite, SampleHfield };
   using Ids = nb::ndarray<nb::ndim<1>, nb::c_contig>;
 
-  Batch(nb::object model, int num_sims, int num_threads, bool forward)
+  Batch(nb::object model, int num_sims, int num_threads, bool forward,
+        std::optional<std::vector<int>> cpu_ids)
       : num_sims_(num_sims), forward_(forward) {
     if (num_sims < 1) throw nb::value_error("num_sims must be >= 1");
     auto addr = nb::cast<uintptr_t>(model.attr("_address"));
@@ -309,8 +369,7 @@ class Batch {
       if (!f.asset) restorable_.push_back(&f);
     }
     scalars_.assign(num_sims, Scalars::Of(template_));
-    if (num_threads <= 0) num_threads = DefaultThreadCount();
-    pool_ = std::make_unique<ThreadPool>(std::max(1, std::min(num_threads, num_sims)));
+    pool_ = MakePool(num_threads, num_sims, std::move(cpu_ids));
     for (int t = 0; t < pool_->size(); ++t) data_.push_back(mj_makeData(template_));
     nstate_ = mj_stateSize(template_, mjSTATE_INTEGRATION);
     states_.resize(static_cast<size_t>(num_sims) * nstate_);

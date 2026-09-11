@@ -3,6 +3,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "batch.h"
 
@@ -61,10 +62,13 @@ mj_setConst on one model. A MuJoCo error on a worker raises RuntimeError naming
 the first failing simulation; the others still ran, and the failing one keeps the
 state it had before the call, its writes still pending. The trap is a MuJoCo log
 handler installed at import; installing another handler later disables it.)")
-      .def(nb::init<nb::object, int, int, bool>(), "model"_a, "num_sims"_a, "num_threads"_a = 0,
-           "forward"_a = false,
+      .def(nb::init<nb::object, int, int, bool, std::optional<std::vector<int>>>(), "model"_a,
+           "num_sims"_a, "num_threads"_a = 0, "forward"_a = false, "cpu_ids"_a = nb::none(),
            "num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends "
-           "every step with mj_forward, so derived fields are current with the state.")
+           "every step with mj_forward, so derived fields are current with the state. "
+           "cpu_ids (Linux only) pins worker i to cpu_ids[i]; its length sets num_threads "
+           "when that is 0 and must equal it otherwise, and passing it on another "
+           "platform raises ValueError.")
       .def_prop_ro("num_sims", &Batch::num_sims)
       .def_prop_ro("num_threads", &Batch::num_threads)
       .def_prop_ro("nstate", &Batch::nstate, "The length of a simulation's integration state.")

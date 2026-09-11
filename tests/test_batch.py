@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import os
 import subprocess
 import sys
 import threading
@@ -375,6 +376,62 @@ def test_step_matches_reference(model, num_threads):
     np.testing.assert_array_equal(qpos[i], d.qpos)
     np.testing.assert_array_equal(qvel[i], d.qvel)
     np.testing.assert_array_equal(sensordata[i], d.sensordata)
+  if sys.platform == "linux":
+    # Pinning workers to CPUs must not change the numerics bit for bit.
+    cpus = sorted(os.sched_getaffinity(0))[:num_threads]
+    pinned = Batch(model, N, cpu_ids=cpus)
+    pinned.bind("ctrl")[:] = ctrl
+    for _ in range(25):
+      pinned.step()
+    pinned.step(nstep=25)
+    assert pinned.num_threads == len(cpus)
+    np.testing.assert_array_equal(pinned.bind("state"), batch.bind("state"))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="cpu_ids pinning is Linux-only")
+def test_cpu_ids_pins_workers(model):
+  cpus = sorted(os.sched_getaffinity(0))[:3]
+  batch = Batch(model, N, cpu_ids=cpus)
+  assert batch.num_threads == len(cpus)
+  # An explicit num_threads equal to the length is accepted too.
+  assert Batch(model, N, num_threads=len(cpus), cpu_ids=cpus).num_threads == len(cpus)
+  ctrl = batch.bind("ctrl")
+  ctrl[:, 0] = np.linspace(-1, 1, N)
+  qpos = batch.bind("qpos")
+  batch.step(nstep=5)
+  for i, d in enumerate(reference(model, ctrl, 5)):
+    np.testing.assert_array_equal(qpos[i], d.qpos)
+  # Every worker's affinity mask is exactly its one pinned CPU, read back
+  # through the per-thread view of sched_getaffinity.
+  masks = set()
+  for tid in os.listdir("/proc/self/task"):
+    try:
+      masks.add(frozenset(os.sched_getaffinity(int(tid))))
+    except (ProcessLookupError, PermissionError):
+      continue
+  assert {frozenset({cpu}) for cpu in cpus} <= masks
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="cpu_ids pinning is Linux-only")
+def test_cpu_ids_validation(model):
+  cpus = sorted(os.sched_getaffinity(0))
+  outside = next(cpu for cpu in range(4096) if cpu not in cpus)
+  with pytest.raises(ValueError, match="not available"):
+    Batch(model, N, cpu_ids=[outside])
+  with pytest.raises(ValueError, match="unique"):
+    Batch(model, N, cpu_ids=[cpus[0], cpus[0]])
+  with pytest.raises(ValueError, match="non-empty"):
+    Batch(model, N, cpu_ids=[])
+  with pytest.raises(ValueError, match=r">= 0"):
+    Batch(model, N, cpu_ids=[-1])
+  with pytest.raises(ValueError, match="num_threads"):
+    Batch(model, N, num_threads=len(cpus) + 1, cpu_ids=cpus)
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="Linux accepts cpu_ids")
+def test_cpu_ids_rejected_off_linux(model):
+  with pytest.raises(ValueError, match="only supported on Linux"):
+    Batch(model, N, cpu_ids=[0])
 
 
 def test_forward_after_step(model):

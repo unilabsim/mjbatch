@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Annotated
 
 from numpy.typing import NDArray
@@ -50,9 +51,9 @@ class Batch:
     handler installed at import; installing another handler later disables it.
     """
 
-    def __init__(self, model: object, num_sims: int, num_threads: int = 0, forward: bool = False) -> None:
+    def __init__(self, model: object, num_sims: int, num_threads: int = 0, forward: bool = False, cpu_ids: Sequence[int] | None = None) -> None:
         """
-        num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends every step with mj_forward, so derived fields are current with the state.
+        num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends every step with mj_forward, so derived fields are current with the state. cpu_ids (Linux only) pins worker i to cpu_ids[i]; its length sets num_threads when that is 0 and must equal it otherwise, and passing it on another platform raises ValueError.
         """
 
     @property

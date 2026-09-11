@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,8 +51,9 @@ class Batch(_Batch):
     num_sims: int,
     num_threads: int = 0,
     forward: bool = False,
+    cpu_ids: Sequence[int] | None = None,
   ) -> None:
-    super().__init__(model, num_sims, num_threads, forward)
+    super().__init__(model, num_sims, num_threads, forward, cpu_ids)
     self.model = model
 
   def sensor(self, name: str, dtype: Any = None) -> np.ndarray:

@@ -11,6 +11,7 @@ Features include:
 * Live array access to simulation state and controls across the batch, with `bind` for MjData fields;
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
 * Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield`.
+* Optional per-worker CPU pinning on Linux, with `cpu_ids` binding pool worker `i` to `cpu_ids[i]`.
 
 For example:
 
