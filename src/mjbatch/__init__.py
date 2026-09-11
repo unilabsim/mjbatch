@@ -103,15 +103,28 @@ class Batch(_Batch):
     return jacp, jacr
 
   def sample_hfield(  # pyright: ignore[reportIncompatibleMethodOverride]  # name-based allocating wrapper
-    self, geom: str, body: str, offsets: np.ndarray, ids: Any = None
+    self,
+    geom: str,
+    body: str,
+    offsets: np.ndarray,
+    ids: Any = None,
+    alignment: str = "world",
+    output: str = "height",
   ) -> np.ndarray:
-    """Bilinear hfield heights at world-frame XY offsets around a body's origin.
+    """Bilinear hfield sampling at XY offsets around a body's origin.
 
-    offsets: (npoint, 2). Returns (nsel, npoint) local heights. All simulations
-    sample the template's hfield. Runs kinematics only, not mj_forward."""
+    offsets: (npoint, 2), in the sampling grid's frame. alignment rotates the
+    grid: "world" keeps offsets in world axes, "yaw" rotates them by the hfield
+    geom's yaw about world z, "body" by the geom's full rotation. output:
+    "height" returns the hfield elevation at each point; "clearance" returns
+    the signed distance along the geom z-axis from the hfield surface to the
+    sample point at the body's height (bpos_z - gpos_z - height for an
+    unrotated geom). Returns (nsel, npoint). All simulations sample the
+    template's hfield; a per-sim geom_pos/geom_quat moves the sampling frame.
+    Runs kinematics only, not mj_forward."""
     g = self.model.geom(geom).id
     b = self.model.body(body).id
     offsets = np.ascontiguousarray(offsets, dtype=np.float64)
     out = np.zeros((self._nsel(ids), offsets.shape[0]))
-    super().sample_hfield(g, b, offsets, out, ids)
+    super().sample_hfield(g, b, offsets, out, ids, alignment, output)
     return out

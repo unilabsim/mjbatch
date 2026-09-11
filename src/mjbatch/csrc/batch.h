@@ -231,6 +231,10 @@ struct Scalars {
   }
 };
 
+// SampleHfield grid alignment: offsets stay in world axes (World), rotate with
+// the geom's yaw about world z (Yaw), or with the geom's full rotation (Body).
+enum class HfieldAlign { World, Yaw, Body };
+
 // Per-call context for the query ops (JacSite, SampleHfield): outputs are
 // caller-allocated arrays, one row per selected sim, like step's history.
 struct QueryCtx {
@@ -238,18 +242,25 @@ struct QueryCtx {
   mjtNum* jacp = nullptr;     // (sel, 3, nv) rows, either may be null
   mjtNum* jacr = nullptr;
   int geom = -1, body = -1;   // SampleHfield: hfield geom id, frame body id
-  const mjtNum* offsets = nullptr;  // (npoint, 2) world-frame XY around the body origin
+  const mjtNum* offsets = nullptr;  // (npoint, 2) grid-frame XY around the body origin
   int npoint = 0;
+  HfieldAlign align = HfieldAlign::World;  // SampleHfield: sampling grid rotation
+  bool clearance = false;                  // SampleHfield: clearance instead of height
   mjtNum* out = nullptr;      // (sel, npoint) rows
 };
 
-// Bilinear height sampling of one hfield geom at world-frame XY points given as
-// offsets from a frame body's origin. Points are transformed into the geom's
-// local frame (its pose comes from the sim's mjData, so per-sim geom_pos applies);
-// the hfield grid itself is the model's, shared by all sims. Returns local
-// heights (interp * size[2]); the grid mapping and clamping match MuJoCo's
-// hfield contact convention for the XY extent [-size[0], size[0]] x
-// [-size[1], size[1]].
+// Bilinear sampling of one hfield geom at XY offsets from a frame body's origin.
+// The offsets form a sampling grid rotated per ctx.align: World keeps them in
+// world axes, Yaw rotates them by the geom's yaw about world z (extracted from
+// geom_xmat), Body by the geom's full rotation. Sample points are transformed
+// into the geom's local frame (its pose comes from the sim's mjData, so per-sim
+// geom_pos/geom_quat apply); the hfield grid itself is the model's, shared by
+// all sims. The grid mapping and clamping match MuJoCo's hfield contact
+// convention for the XY extent [-size[0], size[0]] x [-size[1], size[1]].
+// output=height returns local heights (interp * size[2]); output=clearance
+// returns the signed distance along the geom z-axis from the hfield surface to
+// the query point, which is the sample point taken at the frame body's height
+// (so bpos_z - gpos_z - height for an unrotated geom).
 inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx) {
   int hfield = m->geom_dataid[ctx.geom];
   int nrow = m->hfield_nrow[hfield], ncol = m->hfield_ncol[hfield];
@@ -258,8 +269,26 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
   const mjtNum* gpos = d->geom_xpos + 3 * ctx.geom;
   const mjtNum* gmat = d->geom_xmat + 9 * ctx.geom;
   const mjtNum* bpos = d->xpos + 3 * ctx.body;
+  mjtNum cyaw = 1.0, syaw = 0.0;  // geom yaw about world z, for HfieldAlign::Yaw
+  if (ctx.align == HfieldAlign::Yaw) {
+    cyaw = mju_cos(mju_atan2(gmat[1], gmat[0]));
+    syaw = mju_sin(mju_atan2(gmat[1], gmat[0]));
+  }
   for (int k = 0; k < ctx.npoint; ++k) {
-    mjtNum wp[3] = {bpos[0] + ctx.offsets[2 * k], bpos[1] + ctx.offsets[2 * k + 1], gpos[2]};
+    mjtNum ox = ctx.offsets[2 * k], oy = ctx.offsets[2 * k + 1];
+    mjtNum rx = ox, ry = oy, rz = 0.0;
+    if (ctx.align == HfieldAlign::Yaw) {
+      rx = cyaw * ox - syaw * oy;
+      ry = syaw * ox + cyaw * oy;
+    } else if (ctx.align == HfieldAlign::Body) {
+      rx = gmat[0] * ox + gmat[3] * oy;
+      ry = gmat[1] * ox + gmat[4] * oy;
+      rz = gmat[2] * ox + gmat[5] * oy;
+    }
+    // World and Yaw sample in the geom-center plane; Body tilts the grid, so
+    // the query point keeps the body origin's height plus the rotated offset.
+    mjtNum wp[3] = {bpos[0] + rx, bpos[1] + ry,
+                    ctx.align == HfieldAlign::Body ? bpos[2] + rz : gpos[2]};
     mjtNum rel[3], lp[3];
     mju_sub3(rel, wp, gpos);
     mju_mulMatTVec(lp, gmat, rel, 3, 3);
@@ -274,7 +303,16 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
                sx * (1 - sy) * data[iy * ncol + ix1] +
                (1 - sx) * sy * data[iy1 * ncol + ix] +
                sx * sy * data[iy1 * ncol + ix1];
-    ctx.out[k] = h * hsize[2];
+    h *= hsize[2];
+    if (ctx.clearance) {
+      // lp[2] is the geom-space z of wp; for World/Yaw the query point sits at
+      // the body origin's height, adding gmat[8] * (bpos_z - gpos_z).
+      mjtNum qz = lp[2];
+      if (ctx.align != HfieldAlign::Body) qz += gmat[8] * (bpos[2] - gpos[2]);
+      ctx.out[k] = qz - h;
+    } else {
+      ctx.out[k] = h;
+    }
   }
 }
 
@@ -424,23 +462,44 @@ class Batch {
     Run(Op::JacSite, std::move(sel), 0, nullptr, &ctx);
   }
 
-  // Bilinear hfield heights per selected sim at world-frame XY offsets around a
-  // frame body's origin, into caller-allocated (sel, npoint) rows. Runs
-  // kinematics only. All sims sample the template's hfield; a per-sim geom_pos
-  // moves the sampling frame.
+  // Bilinear hfield sampling per selected sim at XY offsets around a frame
+  // body's origin, into caller-allocated (sel, npoint) rows. Runs kinematics
+  // only. All sims sample the template's hfield; a per-sim geom_pos/geom_quat
+  // moves the sampling frame. alignment rotates the sampling grid: "world"
+  // keeps offsets in world axes, "yaw" rotates them by the geom's yaw about
+  // world z, "body" by the geom's full rotation. output: "height" returns the
+  // hfield elevation at each point; "clearance" returns the signed distance
+  // along the geom z-axis from the hfield surface to the query point (the
+  // sample point at the frame body's height).
   void sample_hfield(int geom, int body, const nb::ndarray<>& offsets, nb::ndarray<> out,
-                     std::optional<Ids> ids) {
+                     std::optional<Ids> ids, const std::string& alignment,
+                     const std::string& output) {
     if (geom < 0 || geom >= template_->ngeom) throw nb::value_error("geom out of range");
     if (template_->geom_type[geom] != mjGEOM_HFIELD) {
       throw nb::value_error("geom is not a hfield");
     }
     if (body < 0 || body >= template_->nbody) throw nb::value_error("body out of range");
+    HfieldAlign align;
+    if (alignment == "world") {
+      align = HfieldAlign::World;
+    } else if (alignment == "yaw") {
+      align = HfieldAlign::Yaw;
+    } else if (alignment == "body") {
+      align = HfieldAlign::Body;
+    } else {
+      throw nb::value_error("alignment must be \"world\", \"yaw\" or \"body\"");
+    }
+    if (output != "height" && output != "clearance") {
+      throw nb::value_error("output must be \"height\" or \"clearance\"");
+    }
     auto sel = Parse(ids);
     int nsel = sel ? static_cast<int>(sel->size()) : num_sims_;
     QueryCtx ctx;
     ctx.geom = geom;
     ctx.body = body;
     ctx.offsets = OffsetsPtr(offsets, ctx.npoint);
+    ctx.align = align;
+    ctx.clearance = output == "clearance";
     ctx.out = OutPtr(out, nsel, 1, ctx.npoint, "out");
     Run(Op::SampleHfield, std::move(sel), 0, nullptr, &ctx);
   }

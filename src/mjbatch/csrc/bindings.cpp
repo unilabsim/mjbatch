@@ -87,9 +87,16 @@ handler installed at import; installing another handler later disables it.)")
            "mj_forward, so bound derived fields are refreshed to kinematics level.")
       .def("sample_hfield", &Batch::sample_hfield, "geom"_a, "body"_a,
            "offsets"_a.noconvert(), "out"_a.noconvert(), "ids"_a.noconvert() = nb::none(),
-           "Bilinear hfield heights per selected simulation at world-frame XY offsets "
-           "around a frame body's origin, into caller-allocated (sel, npoint) rows. Runs "
-           "mj_kinematics only. All simulations sample the template's hfield; a per-sim "
-           "geom_pos moves the sampling frame.")
+           "alignment"_a = "world", "output"_a = "height",
+           "Bilinear hfield sampling per selected simulation at XY offsets around a frame "
+           "body's origin, into caller-allocated (sel, npoint) rows. alignment rotates the "
+           "sampling grid: \"world\" keeps offsets in world axes, \"yaw\" rotates them by "
+           "the geom's yaw about world z, \"body\" by the geom's full rotation. output: "
+           "\"height\" returns the hfield elevation at each point; \"clearance\" returns "
+           "the signed distance along the geom z-axis from the hfield surface to the query "
+           "point (the sample point at the frame body's height, so bpos_z - gpos_z - "
+           "height for an unrotated geom). Runs mj_kinematics only. All simulations sample "
+           "the template's hfield; a per-sim geom_pos or geom_quat moves the sampling "
+           "frame.")
       .def("set_const", &Batch::set_const, "ids"_a.noconvert() = nb::none());
 }

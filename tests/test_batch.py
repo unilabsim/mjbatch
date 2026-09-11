@@ -750,3 +750,175 @@ def test_sample_hfield_matches_reference():
     raw.sample_hfield(geom, 99, offsets, np.zeros((2, len(offsets))))
   with pytest.raises(ValueError, match="offsets"):
     raw.sample_hfield(geom, body, np.zeros(3), np.zeros((2, 3)))
+
+
+# A hfield geom away from the origin, so its rotation moves the sampling frame.
+HFIELD_ROT_XML = """
+<mujoco>
+  <asset>
+    <hfield name="hf" nrow="9" ncol="9" size="1 1 0.5 0.1"/>
+  </asset>
+  <worldbody>
+    <geom name="terrain" type="hfield" hfield="hf" pos="0.3 -0.2 0.1"/>
+    <body name="cart" pos="0 0 0.2">
+      <joint type="slide" axis="1 0 0"/>
+      <joint type="slide" axis="0 1 0"/>
+      <geom type="sphere" size=".05" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def _rot_hfield_model():
+  model = mujoco.MjModel.from_xml_string(HFIELD_ROT_XML)
+  nrow, ncol = model.hfield_nrow[0], model.hfield_ncol[0]
+  model.hfield_data[: nrow * ncol] = np.linspace(0, 1, nrow * ncol)  # known ramp
+  return model
+
+
+def _ref_hfield_aligned(model, qpos_row, geom, body, offsets, alignment, output):
+  d = mujoco.MjData(model)
+  d.qpos[:] = qpos_row
+  mujoco.mj_forward(model, d)
+  hfield = model.geom_dataid[geom]
+  nrow, ncol = model.hfield_nrow[hfield], model.hfield_ncol[hfield]
+  size = model.hfield_size[hfield]
+  data = model.hfield_data[hfield * nrow * ncol : (hfield + 1) * nrow * ncol].reshape(nrow, ncol)
+  gpos, gmat = d.geom_xpos[geom], d.geom_xmat[geom].reshape(3, 3)
+  bpos = d.xpos[body]
+  out = np.zeros(len(offsets))
+  for k, (ox, oy) in enumerate(offsets):
+    r = np.array([ox, oy, 0.0])
+    if alignment == "yaw":
+      yaw = np.arctan2(gmat[1, 0], gmat[0, 0])
+      c, s = np.cos(yaw), np.sin(yaw)
+      r = np.array([c * ox - s * oy, s * ox + c * oy, 0.0])
+    elif alignment == "body":
+      r = gmat @ r
+    w = bpos + r
+    if alignment != "body":
+      w[2] = gpos[2]  # the sampling plane passes through the geom center
+    lp = gmat.T @ (w - gpos)
+    fx = np.clip((lp[0] / size[0] + 1.0) * 0.5 * (ncol - 1), 0, ncol - 1.001)
+    fy = np.clip((lp[1] / size[1] + 1.0) * 0.5 * (nrow - 1), 0, nrow - 1.001)
+    ix, iy = int(fx), int(fy)
+    sx, sy = fx - ix, fy - iy
+    h = (
+      (1 - sx) * (1 - sy) * data[iy, ix]
+      + sx * (1 - sy) * data[iy, min(ix + 1, ncol - 1)]
+      + (1 - sx) * sy * data[min(iy + 1, nrow - 1), ix]
+      + sx * sy * data[min(iy + 1, nrow - 1), min(ix + 1, ncol - 1)]
+    ) * size[2]
+    if output == "height":
+      out[k] = h
+    else:
+      # Signed distance along the geom z-axis from the hfield surface to the
+      # query point (the sample point at the body origin's height).
+      q = np.array([w[0], w[1], bpos[2] + r[2]])
+      surface = gpos + gmat @ np.array([lp[0], lp[1], h])
+      out[k] = gmat[:, 2] @ (q - surface)
+  return out
+
+
+def test_sample_hfield_yaw_alignment():
+  model = _rot_hfield_model()
+  geom, body = model.geom("terrain").id, model.body("cart").id
+  batch = Batch(model, N, num_threads=3)
+  rng = np.random.default_rng(2)
+  qpos = batch.bind("qpos")
+  qpos[:] = model.qpos0 + rng.uniform(-0.5, 0.5, (N, model.nq))
+  # A per-sim terrain yaw through expanded geom_quat; the grid follows the geom.
+  quat = batch.expand("geom_quat")
+  yaw = rng.uniform(-np.pi, np.pi, N)
+  quat[:, geom] = np.stack([np.cos(yaw / 2), np.zeros(N), np.zeros(N), np.sin(yaw / 2)], axis=1)
+  offsets = np.array([[i * 0.06, j * 0.06] for i in (-1, 0, 1) for j in (-1, 0, 1)])
+  out = batch.sample_hfield("terrain", "cart", offsets, alignment="yaw")
+  assert out.shape == (N, len(offsets))
+  for i in range(N):
+    model.geom_quat[geom] = quat[i, geom]
+    ref = _ref_hfield_aligned(model, qpos[i], geom, body, offsets, "yaw", "height")
+    np.testing.assert_allclose(out[i], ref, rtol=1e-7, atol=1e-12)
+  # For a pure yaw rotation, body alignment samples the same points.
+  np.testing.assert_allclose(batch.sample_hfield("terrain", "cart", offsets, alignment="body"), out)
+  # Subset rows follow the selection.
+  ids = np.array([2, 6])
+  sub = batch.sample_hfield("terrain", "cart", offsets, ids=ids, alignment="yaw")
+  np.testing.assert_allclose(sub, out[ids])
+
+
+def test_sample_hfield_body_alignment():
+  model = _rot_hfield_model()
+  geom, body = model.geom("terrain").id, model.body("cart").id
+  batch = Batch(model, N, num_threads=3)
+  rng = np.random.default_rng(3)
+  qpos = batch.bind("qpos")
+  qpos[:] = model.qpos0 + rng.uniform(-0.5, 0.5, (N, model.nq))
+  # Random per-sim terrain orientations, not just yaws.
+  quat = batch.expand("geom_quat")
+  q = rng.normal(size=(N, 4))
+  quat[:, geom] = q / np.linalg.norm(q, axis=1, keepdims=True)
+  offsets = np.array([[i * 0.06, j * 0.06] for i in (-1, 0, 1) for j in (-1, 0, 1)])
+  out = batch.sample_hfield("terrain", "cart", offsets, alignment="body")
+  assert out.shape == (N, len(offsets))
+  for i in range(N):
+    model.geom_quat[geom] = quat[i, geom]
+    ref = _ref_hfield_aligned(model, qpos[i], geom, body, offsets, "body", "height")
+    np.testing.assert_allclose(out[i], ref, rtol=1e-7, atol=1e-12)
+
+
+def test_sample_hfield_clearance():
+  model = _rot_hfield_model()
+  geom, body = model.geom("terrain").id, model.body("cart").id
+  batch = Batch(model, N, num_threads=3)
+  rng = np.random.default_rng(4)
+  qpos = batch.bind("qpos")
+  qpos[:] = model.qpos0 + rng.uniform(-0.5, 0.5, (N, model.nq))
+  quat = batch.expand("geom_quat")
+  q = rng.normal(size=(N, 4))
+  quat[:, geom] = q / np.linalg.norm(q, axis=1, keepdims=True)
+  offsets = np.array([[i * 0.06, j * 0.06] for i in (-1, 0, 1) for j in (-1, 0, 1)])
+  for alignment in ("world", "yaw", "body"):
+    out = batch.sample_hfield("terrain", "cart", offsets, alignment=alignment, output="clearance")
+    for i in range(N):
+      model.geom_quat[geom] = quat[i, geom]
+      ref = _ref_hfield_aligned(model, qpos[i], geom, body, offsets, alignment, "clearance")
+      np.testing.assert_allclose(out[i], ref, rtol=1e-7, atol=1e-12)
+  # An unrotated geom: clearance is bpos_z - gpos_z - height.
+  flat_model = mujoco.MjModel.from_xml_string(HFIELD_XML)
+  nrow, ncol = flat_model.hfield_nrow[0], flat_model.hfield_ncol[0]
+  flat_model.hfield_data[: nrow * ncol] = np.linspace(0, 1, nrow * ncol)
+  flat = Batch(flat_model, N, num_threads=3)
+  flat_qpos = flat.bind("qpos")
+  flat_qpos[:] = flat_model.qpos0 + rng.uniform(-0.5, 0.5, (N, flat_model.nq))
+  h = flat.sample_hfield("terrain", "cart", offsets)
+  c = flat.sample_hfield("terrain", "cart", offsets, output="clearance")
+  fgeom, fbody = flat_model.geom("terrain").id, flat_model.body("cart").id
+  for i in range(N):
+    d = mujoco.MjData(flat_model)
+    d.qpos[:] = flat_qpos[i]
+    mujoco.mj_kinematics(flat_model, d)
+    dz = d.xpos[fbody, 2] - d.geom_xpos[fgeom, 2]
+    np.testing.assert_allclose(c[i], dz - h[i], rtol=1e-7, atol=1e-12)
+
+
+def test_sample_hfield_alignment_output_errors():
+  model = _rot_hfield_model()
+  geom, body = model.geom("terrain").id, model.body("cart").id
+  offsets = np.zeros((3, 2))
+  batch = Batch(model, 2)
+  with pytest.raises(ValueError, match="alignment"):
+    batch.sample_hfield("terrain", "cart", offsets, alignment="diagonal")
+  with pytest.raises(ValueError, match="output"):
+    batch.sample_hfield("terrain", "cart", offsets, output="depth")
+  from mjbatch._bindings import Batch as RawBatch
+
+  raw = RawBatch(model, 2)
+  with pytest.raises(ValueError, match="alignment"):
+    raw.sample_hfield(geom, body, offsets, np.zeros((2, 3)), None, "diagonal", "height")
+  with pytest.raises(ValueError, match="output"):
+    raw.sample_hfield(geom, body, offsets, np.zeros((2, 3)), None, "world", "depth")
+  # Defaults are world/height: the same call spelled out matches the defaults.
+  default = batch.sample_hfield("terrain", "cart", offsets)
+  spelled = batch.sample_hfield("terrain", "cart", offsets, alignment="world", output="height")
+  np.testing.assert_array_equal(default, spelled)
