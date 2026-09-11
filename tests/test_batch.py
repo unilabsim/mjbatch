@@ -633,3 +633,121 @@ def test_state_rows_copy_restore_and_compose(model):
   with pytest.raises(ValueError):
     batch.bind("state", np.float32)
   assert np.shares_memory(batch.bind("state"), state)
+
+
+HFIELD_XML = """
+<mujoco>
+  <asset>
+    <hfield name="hf" nrow="9" ncol="9" size="1 1 0.5 0.1"/>
+  </asset>
+  <worldbody>
+    <geom name="terrain" type="hfield" hfield="hf"/>
+    <body name="cart" pos="0 0 0.2">
+      <joint type="slide" axis="1 0 0"/>
+      <joint type="slide" axis="0 1 0"/>
+      <geom type="sphere" size=".05" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def _ref_hfield(model, qpos_row, geom, body, offsets):
+  d = mujoco.MjData(model)
+  d.qpos[:] = qpos_row
+  mujoco.mj_forward(model, d)
+  hfield = model.geom_dataid[geom]
+  nrow, ncol = model.hfield_nrow[hfield], model.hfield_ncol[hfield]
+  size = model.hfield_size[hfield]
+  data = model.hfield_data[hfield * nrow * ncol : (hfield + 1) * nrow * ncol].reshape(nrow, ncol)
+  gpos, gmat = d.geom_xpos[geom], d.geom_xmat[geom].reshape(3, 3)
+  bpos = d.xpos[body]
+  out = np.zeros(len(offsets))
+  for k, (ox, oy) in enumerate(offsets):
+    w = np.array([bpos[0] + ox, bpos[1] + oy, gpos[2]])
+    lp = gmat.T @ (w - gpos)
+    fx = np.clip((lp[0] / size[0] + 1.0) * 0.5 * (ncol - 1), 0, ncol - 1.001)
+    fy = np.clip((lp[1] / size[1] + 1.0) * 0.5 * (nrow - 1), 0, nrow - 1.001)
+    ix, iy = int(fx), int(fy)
+    sx, sy = fx - ix, fy - iy
+    h = (
+      (1 - sx) * (1 - sy) * data[iy, ix]
+      + sx * (1 - sy) * data[iy, min(ix + 1, ncol - 1)]
+      + (1 - sx) * sy * data[min(iy + 1, nrow - 1), ix]
+      + sx * sy * data[min(iy + 1, nrow - 1), min(ix + 1, ncol - 1)]
+    )
+    out[k] = h * size[2]
+  return out
+
+
+def test_jac_site_matches_serial(model):
+  batch = Batch(model, N, num_threads=3)
+  rng = np.random.default_rng(0)
+  qpos = batch.bind("qpos")
+  qpos[:] = model.qpos0 + rng.uniform(-0.2, 0.2, (N, model.nq))
+  expected_qpos = qpos.copy()
+  site = model.site("tip").id
+  jacp, jacr = batch.jac_site("tip")
+  assert jacp.shape == (N, 3, model.nv) and jacr.shape == (N, 3, model.nv)
+  for i in range(N):
+    d = mujoco.MjData(model)
+    d.qpos[:] = qpos[i]
+    mujoco.mj_kinematics(model, d)
+    mujoco.mj_comPos(model, d)
+    jp, jr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+    mujoco.mj_jacSite(model, d, jp, jr, site)
+    np.testing.assert_array_equal(jacp[i], jp)
+    np.testing.assert_array_equal(jacr[i], jr)
+  # A subset fills one row per selected sim, in selection order.
+  ids = np.array([1, 3, 4])
+  sub_p, sub_r = batch.jac_site("tip", ids=ids)
+  np.testing.assert_array_equal(sub_p, jacp[ids])
+  np.testing.assert_array_equal(sub_r, jacr[ids])
+  mask = np.zeros(N, dtype=bool)
+  mask[5] = True
+  np.testing.assert_array_equal(batch.jac_site("tip", ids=mask)[0], jacp[5][None])
+  # The call runs kinematics only: qpos is untouched.
+  np.testing.assert_array_equal(qpos, expected_qpos)
+  from mjbatch._bindings import Batch as RawBatch
+
+  raw = RawBatch(model, 2)
+  with pytest.raises(ValueError, match="out of range"):
+    raw.jac_site(99, None, np.zeros((2, 3, model.nv)))
+  with pytest.raises(ValueError, match="both"):
+    raw.jac_site(0, None, None)
+  with pytest.raises(ValueError, match="shape"):
+    raw.jac_site(0, np.zeros((2, 3, model.nv + 1)), None)
+
+
+def test_sample_hfield_matches_reference():
+  model = mujoco.MjModel.from_xml_string(HFIELD_XML)
+  hfield = 0
+  nrow, ncol = model.hfield_nrow[hfield], model.hfield_ncol[hfield]
+  model.hfield_data[: nrow * ncol] = np.linspace(0, 1, nrow * ncol)  # known ramp
+  geom = model.geom("terrain").id
+  body = model.body("cart").id
+  batch = Batch(model, N, num_threads=3)
+  rng = np.random.default_rng(1)
+  qpos = batch.bind("qpos")
+  qpos[:] = model.qpos0 + rng.uniform(-0.5, 0.5, (N, model.nq))
+  offsets = np.array([[i * 0.06, j * 0.06] for i in (-1, 0, 1) for j in (-1, 0, 1)])
+  out = batch.sample_hfield("terrain", "cart", offsets)
+  assert out.shape == (N, len(offsets))
+  for i in range(N):
+    np.testing.assert_allclose(out[i], _ref_hfield(model, qpos[i], geom, body, offsets))
+  # Points outside the grid clamp to the border height.
+  far = np.array([[5.0, 5.0], [-5.0, -5.0]])
+  out_far = batch.sample_hfield("terrain", "cart", far, ids=np.array([0]))
+  np.testing.assert_allclose(out_far[0], _ref_hfield(model, qpos[0], geom, body, far))
+  # Subset rows follow the selection.
+  ids = np.array([2, 6])
+  np.testing.assert_allclose(batch.sample_hfield("terrain", "cart", offsets, ids=ids), out[ids])
+  from mjbatch._bindings import Batch as RawBatch
+
+  raw = RawBatch(model, 2)
+  with pytest.raises(ValueError, match="not a hfield"):
+    raw.sample_hfield(1, body, offsets, np.zeros((2, len(offsets))))
+  with pytest.raises(ValueError, match="out of range"):
+    raw.sample_hfield(geom, 99, offsets, np.zeros((2, len(offsets))))
+  with pytest.raises(ValueError, match="offsets"):
+    raw.sample_hfield(geom, body, np.zeros(3), np.zeros((2, 3)))
