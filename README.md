@@ -27,6 +27,36 @@ for _ in range(1000):
   batch.step()                       # step them in parallel; qpos updates in place
 ```
 
+## Per-simulation model fields
+
+`expand(field)` returns a live `(num_sims, ...)` view of a non-asset `MjModel` field.
+Rows are applied to MuJoCo before that simulation's next call. Use `set_const(ids)`
+after changing inputs such as mass or inertia; it runs `mj_setConst` per selected
+simulation and expands the derived fields that MuJoCo changed.
+
+```python
+mass = batch.expand("body_mass")
+mass[[1, 4, 7], body_id] *= 1.2
+batch.set_const(np.array([1, 4, 7]))
+```
+
+Asset arrays (`mesh_*`, `hfield_*`, `tex_*`, and related large constant data) are
+shared and immutable. A model can nevertheless pool multiple meshes in one canonical
+layout and select one per simulation through `geom_dataid`:
+
+```python
+mesh_id = canonical.geom("mesh").id
+dataid = batch.expand("geom_dataid")
+dataid[tool_envs, mesh_id] = pooled_mesh_ids[tool_envs]
+```
+
+Mesh geometry also affects compiler-derived fields such as `geom_size`,
+`geom_rbound`, `geom_aabb`, `geom_pos`, `geom_quat`, `body_inertia`,
+`body_invweight0`, `body_ipos`, and `body_iquat`. Scatter those values from
+independently compiled reference models before calling `set_const`. mjbatch does
+not yet construct or deduplicate the canonical model automatically; all pooled
+variants must share the same model layout.
+
 ## Examples
 
 We showcase a range of applications built using `mjbatch`: RL, MPC, SysID, and hardware

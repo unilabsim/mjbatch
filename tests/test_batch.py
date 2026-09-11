@@ -159,6 +159,98 @@ def test_lockstep_with_expanded_mass(nstep):
   lockstep(nstep, num_threads=4, heavy=(1, 2, 5))
 
 
+@pytest.mark.parametrize("num_threads", [1, 3])
+def test_mesh_pool_geom_dataid_matches_reference_models(tmp_path, num_threads):
+  """A canonical model can pool meshes and select one per simulation.
+
+  The compiler-derived fields are scattered from independently compiled reference
+  models, then set_const recomputes the constants that depend on them. This is the
+  stock-CPU foundation for future variant-pack construction: assets stay shared,
+  while geom_dataid and non-asset model fields become per-simulation rows.
+  """
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(
+    "\n".join(
+      [
+        "v 0 0 0",
+        "v 1 0 0",
+        "v 0 1 0",
+        "v 0 0 1",
+        "f 1 3 2",
+        "f 1 2 4",
+        "f 1 4 3",
+        "f 2 3 4",
+        "",
+      ]
+    )
+  )
+
+  def compile_model(assets: str) -> mujoco.MjModel:
+    xml = f"""
+<mujoco>
+  <option timestep="0.002"/>
+  <asset>{assets}</asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 .1"/>
+    <body name="body" pos=".01 .02 .8">
+      <freejoint/>
+      <geom name="mesh" type="mesh" mesh="mesh0" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    return mujoco.MjModel.from_xml_string(xml)
+
+  canonical = compile_model(
+    f'<mesh name="mesh0" file="{obj_path}"/><mesh name="mesh1" file="{obj_path}" scale=".7 .8 1.2"/>'
+  )
+  references = [
+    compile_model(f'<mesh name="mesh0" file="{obj_path}"/>'),
+    compile_model(f'<mesh name="mesh0" file="{obj_path}" scale=".7 .8 1.2"/>'),
+  ]
+
+  batch = Batch(canonical, N, num_threads=num_threads)
+  variant_ids = np.array([1, 3, 4, 7])
+  mesh_geom = canonical.geom("mesh").id
+  variant_fields = (
+    "geom_size",
+    "geom_rbound",
+    "geom_aabb",
+    "geom_pos",
+    "geom_quat",
+    "body_mass",
+    "body_subtreemass",
+    "body_inertia",
+    "body_invweight0",
+    "body_ipos",
+    "body_iquat",
+  )
+  for field in variant_fields:
+    batch.expand(field)[variant_ids] = getattr(references[1], field)
+
+  geom_dataid = batch.expand("geom_dataid")
+  geom_dataid[variant_ids, mesh_geom] = 1
+  batch.set_const(variant_ids)
+
+  expected_variants = np.zeros(N, dtype=np.int32)
+  expected_variants[variant_ids] = 1
+  np.testing.assert_array_equal(geom_dataid[:, mesh_geom], expected_variants)
+  for field in (*variant_fields, "dof_M0", "dof_invweight0", "dof_length"):
+    expected = [getattr(references[v], field) for v in expected_variants]
+    np.testing.assert_array_equal(batch.expand(field), expected, field)
+
+  state = batch.bind("state")
+  batch.step(nstep=25)
+  for i, reference in enumerate(references):
+    data = mujoco.MjData(reference)
+    for _ in range(25):
+      mujoco.mj_step(reference, data)
+    expected_state = np.empty(batch.nstate)
+    mujoco.mj_getState(reference, data, expected_state, mujoco.mjtState.mjSTATE_INTEGRATION)
+    rows = np.flatnonzero(expected_variants == i)
+    np.testing.assert_array_equal(state[rows], np.tile(expected_state, (len(rows), 1)))
+
+
 def test_sleep_is_rejected():
   xml = LOCKSTEP_XML.replace("<option", '<option><flag sleep="enable"/></option><option')
   with pytest.raises(ValueError, match="sleep"):
