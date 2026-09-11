@@ -11,6 +11,7 @@ Features include:
 * Live array access to simulation state and controls across the batch, with `bind` for MjData fields;
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
 * Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield` (world/yaw/body grid alignment, height or clearance output).
+* Per-substep control from Python with `step(..., callback=...)`, plus warning-based early stop via `stop_on_warning` and per-sim substep counts via `steps_done`.
 
 For example:
 

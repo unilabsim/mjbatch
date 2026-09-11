@@ -93,7 +93,7 @@ def model():
   return mujoco.MjModel.from_xml_string(XML)
 
 
-def lockstep(nstep, num_threads, heavy=()):
+def lockstep(nstep, num_threads, heavy=(), use_callback=False):
   model = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
   models = [model] * N
   batch = Batch(model, N, num_threads=num_threads)
@@ -139,7 +139,16 @@ def lockstep(nstep, num_threads, heavy=()):
         apply(i)
         mujoco.mj_forward(models[i], datas[i])
     else:
-      batch.step(None if len(ids) == N else np.array(ids), nstep=nstep)
+      if use_callback:
+        ctrl_now = batch.bind("ctrl").copy()
+
+        def apply_ctrl(k, state, sensordata, ctrl, value=ctrl_now):
+          assert (sensordata is None) == (k == 0)
+          ctrl[:] = value
+
+        batch.step(None if len(ids) == N else np.array(ids), nstep=nstep, callback=apply_ctrl)
+      else:
+        batch.step(None if len(ids) == N else np.array(ids), nstep=nstep)
       for i in ids:
         apply(i)
         for _ in range(nstep):
@@ -157,6 +166,195 @@ def test_lockstep_with_mj_step(nstep, num_threads):
 @pytest.mark.parametrize("nstep", [1, 3])
 def test_lockstep_with_expanded_mass(nstep):
   lockstep(nstep, num_threads=4, heavy=(1, 2, 5))
+
+
+@pytest.mark.parametrize("nstep", [1, 3])
+@pytest.mark.parametrize("num_threads", [1, 3])
+def test_lockstep_with_callback(nstep, num_threads):
+  lockstep(nstep, num_threads, use_callback=True)
+
+
+@pytest.mark.parametrize("nstep", [1, 3])
+def test_lockstep_with_callback_and_expanded_mass(nstep):
+  lockstep(nstep, num_threads=4, heavy=(1, 2, 5), use_callback=True)
+
+
+@pytest.mark.parametrize("num_threads", [1, 4])
+def test_step_callback_matches_a_python_loop(num_threads):
+  # A callback-driven rollout against step(nstep=1) calls applying the same
+  # per-substep controls, compared bit for bit.
+  model = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  batch, ref = Batch(model, N, num_threads=num_threads), Batch(model, N, num_threads=3)
+  fields = ("state", "qpos", "qvel", "act", "time", "sensordata", "site_xpos")
+  bound = {f: batch.bind(f) for f in fields}
+  reference = {f: ref.bind(f) for f in fields}
+  nstep = 6
+  rng = np.random.default_rng(1)
+  ctrls = rng.uniform(-1, 1, (nstep, N, model.nu))
+  seen = []
+
+  def apply_ctrl(k, state, sensordata, ctrl):
+    seen.append((state.copy(), None if sensordata is None else sensordata.copy()))
+    ctrl[:] = ctrls[k]
+
+  initial = batch.bind("state").copy()
+  history = np.empty((N, nstep, batch.nstate))
+  steps_done = np.full(N, -1, np.int32)
+  batch.step(nstep=nstep, history=history, callback=apply_ctrl, steps_done=steps_done)
+  np.testing.assert_array_equal(steps_done, nstep)
+  assert len(seen) == nstep
+  np.testing.assert_array_equal(seen[0][0], initial)  # k=0: the state before the call
+  assert seen[0][1] is None  # k=0: no sensordata yet
+  for k in range(nstep):
+    ref.bind("ctrl")[:] = ctrls[k]
+    ref.step()
+    np.testing.assert_array_equal(history[:, k], reference["state"])
+    if k + 1 < nstep:  # the views at k + 1 reflect substep k
+      np.testing.assert_array_equal(seen[k + 1][0], reference["state"])
+      np.testing.assert_array_equal(seen[k + 1][1], reference["sensordata"])
+  for field in fields:
+    np.testing.assert_array_equal(bound[field], reference[field], field)
+
+
+@pytest.mark.parametrize("callback", [False, True])
+def test_stop_on_warning_truncates_a_sim(model, callback):
+  batch = Batch(model, N, num_threads=2)
+  qpos, time, warning = (batch.bind(f) for f in ("qpos", "time", "warning"))
+  steps_done = np.full(N, -1, np.int32)
+  qpos[2] = np.nan  # mjWARN_BADQPOS on its first substep
+  if callback:
+    batch.step(
+      nstep=5,
+      steps_done=steps_done,
+      stop_on_warning=True,
+      callback=lambda k, state, sensordata, ctrl: None,
+    )
+  else:
+    batch.step(nstep=5, steps_done=steps_done, stop_on_warning=True)
+  np.testing.assert_array_equal(steps_done, [5, 5, 1, 5, 5, 5, 5, 5])
+  np.testing.assert_allclose(time, [0.01, 0.01, 0.002, 0.01, 0.01, 0.01, 0.01, 0.01])
+  assert warning[2, mujoco.mjtWarning.mjWARN_BADQPOS, 1] == 1
+  assert warning[:, :, 1].sum() == 1
+  # Sim 2 stopped where mj_step left it after sanitizing the NaN: one substep.
+  data = mujoco.MjData(model)
+  data.qpos[:] = np.nan
+  mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(qpos[2], data.qpos)
+  batch.step()  # later calls still work
+  np.testing.assert_allclose(time, [0.012, 0.012, 0.004, 0.012, 0.012, 0.012, 0.012, 0.012])
+
+
+def test_step_callback_with_ids_and_stop_on_warning(model):
+  batch = Batch(model, N, num_threads=2)
+  time, warning = batch.bind("time"), batch.bind("warning")
+  ids = np.array([1, 3, 5])
+  steps_done = np.full(len(ids), -1, np.int32)
+  calls = []
+  batch.bind("qpos")[3] = np.nan  # selected: warns and stops on its first substep
+  batch.bind("qpos")[4] = np.nan  # not selected: never stepped
+
+  def cb(k, state, sensordata, ctrl):
+    calls.append(k)
+
+  batch.step(ids, nstep=6, callback=cb, steps_done=steps_done, stop_on_warning=True)
+  assert calls == list(range(6))
+  np.testing.assert_array_equal(steps_done, [6, 1, 6])
+  np.testing.assert_allclose(time[ids], [0.012, 0.002, 0.012])
+  assert not np.any(time[[0, 2, 4, 6, 7]])
+  assert warning[3, mujoco.mjtWarning.mjWARN_BADQPOS, 1] == 1
+  assert not np.any(warning[[0, 2, 4, 6, 7]])
+  batch.step()  # the batch is still usable, pending writes included
+  np.testing.assert_allclose(time[ids], [0.014, 0.004, 0.014])
+
+
+@pytest.mark.parametrize("num_threads", [1, 3])
+def test_step_callback_error_keeps_completed_substeps(model, num_threads):
+  batch = Batch(model, N, num_threads=num_threads)
+  ctrl, qpos, time = batch.bind("ctrl"), batch.bind("qpos"), batch.bind("time")
+  steps_done = np.full(N, -1, np.int32)
+
+  def cb(k, state, sensordata, ctrl_view):
+    ctrl_view[:] = 0.5
+    if k == 2:
+      raise ValueError("boom")
+
+  with pytest.raises(ValueError, match="boom"):
+    batch.step(nstep=6, callback=cb, steps_done=steps_done)
+  # Two substeps completed; the batch stopped there, consistent and recoverable.
+  np.testing.assert_array_equal(steps_done, 2)
+  np.testing.assert_allclose(time, 2 * 0.002)
+  np.testing.assert_array_equal(ctrl, 0.5)
+  data = mujoco.MjData(model)
+  data.ctrl[:] = 0.5
+  for _ in range(2):
+    mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(qpos, np.tile(data.qpos, (N, 1)))
+  batch.step()
+  mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(qpos, np.tile(data.qpos, (N, 1)))
+  np.testing.assert_allclose(time, 3 * 0.002)
+
+
+def test_step_callback_is_not_reentrant(model):
+  batch = Batch(model, N, num_threads=2)
+  time = batch.bind("time")
+  errors = []
+
+  def cb(k, state, sensordata, ctrl):
+    for call in (lambda: batch.step(), lambda: batch.forward(), lambda: batch.bind("qpos")):
+      try:
+        call()
+      except RuntimeError as e:
+        errors.append(str(e))
+
+  batch.step(nstep=2, callback=cb)
+  assert len(errors) == 6
+  assert all("callback" in e for e in errors)
+  np.testing.assert_allclose(time, 2 * 0.002)  # the outer step completed
+
+
+def test_step_callback_initial_state_and_sensordata_flag(model):
+  batch, ref = Batch(model, N), Batch(model, N)
+  for b in (batch, ref):
+    b.bind("ctrl")[:] = 0.3
+    b.bind("sensordata")
+    b.step(nstep=2)
+  seen = []
+
+  def cb(k, state, sensordata, ctrl):
+    seen.append((state.copy(), None if sensordata is None else sensordata.copy()))
+
+  initial = batch.bind("state").copy()
+  batch.step(nstep=3, callback=cb)
+  np.testing.assert_array_equal(seen[0][0], initial)  # k=0: the state before the call
+  assert seen[0][1] is None  # k=0: sensordata is None even with callback_sensordata=True
+  for k in (1, 2):
+    ref.step()
+    np.testing.assert_array_equal(seen[k][0], ref.bind("state"))
+    np.testing.assert_array_equal(seen[k][1], ref.bind("sensordata"))
+  # callback_sensordata=False passes None at every substep.
+  seen.clear()
+  batch.step(nstep=2, callback=cb, callback_sensordata=False)
+  assert [s[1] for s in seen] == [None, None]
+
+
+def test_steps_done_validation(model):
+  batch = Batch(model, N)
+  for bad in (
+    np.empty(N, np.int64),
+    np.empty((N, 1), np.int32),
+    np.empty(N - 1, np.int32),
+    np.empty(2 * N, np.int32)[::2],
+  ):
+    with pytest.raises(ValueError, match="steps_done"):
+      batch.step(steps_done=bad)
+  with pytest.raises(ValueError, match="steps_done"):
+    batch.step(np.array([0, 1]), steps_done=np.empty(N, np.int32))
+  batch.step(np.zeros(N, dtype=bool), nstep=2, steps_done=np.empty(0, np.int32))
+  assert not np.any(batch.bind("time"))  # the rejected calls never ran
+  steps_done = np.full(N, -1, np.int32)
+  batch.step(nstep=3, steps_done=steps_done)
+  np.testing.assert_array_equal(steps_done, 3)
 
 
 def test_sleep_is_rejected():
