@@ -11,6 +11,7 @@ import mujoco
 import numpy as np
 
 from mjbatch._bindings import Batch as _Batch
+from mjbatch.variants import VariantPack
 
 _QPOS_WIDTH = {0: 7, 1: 4, 2: 1, 3: 1}  # by mjtJoint: free, ball, slide, hinge
 _DOF_WIDTH = {0: 6, 1: 3, 2: 1, 3: 1}
@@ -137,6 +138,35 @@ class Batch(_Batch):
     self._expanded_fields: dict[str, np.ndarray] = {}
     self._active_model_update: _ModelUpdateState | None = None
     self._python_mutex = threading.RLock()
+    self.variant_pack: VariantPack | None = None
+    self.variant_assignment: np.ndarray | None = None
+
+  @classmethod
+  def from_variant_pack(
+    cls,
+    pack: VariantPack,
+    num_sims: int,
+    assignment: Any,
+    num_threads: int = 0,
+    forward: bool = False,
+  ) -> "Batch":
+    """Construct a batch from compiler-coherent, same-layout mesh variants."""
+    ids = np.ascontiguousarray(assignment)
+    if ids.ndim != 1 or ids.shape[0] != num_sims:
+      raise ValueError("assignment must have one entry per simulation")
+    if ids.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+      raise ValueError("assignment must contain int32 or int64 variant ids")
+    checked = ids.astype(np.int64, copy=False)
+    if checked.size and (checked.min() < 0 or checked.max() >= pack.num_variants):
+      raise ValueError("assignment entries must be in variant range")
+
+    batch = cls(pack.model, num_sims, num_threads=num_threads, forward=forward)
+    with batch.model_update():
+      for name, values in pack.fields.items():
+        batch.expand(name)[:] = values[ids]
+    batch.variant_pack = pack
+    batch.variant_assignment = ids.copy()
+    return batch
 
   def _build_model_fields(self, model: mujoco.MjModel) -> Mapping[str, ModelFieldSpec]:
     specs: dict[str, ModelFieldSpec] = {}
