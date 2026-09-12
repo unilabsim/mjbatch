@@ -96,7 +96,7 @@ class Batch(_Batch):
     """World-frame position/rotation Jacobians of a site, per selected simulation.
 
     Returns (jacp, jacr) with shape (nsel, 3, nv). Runs kinematics and comPos
-    only, not mj_forward."""
+    only, not mj_forward, and does not refresh the bound views."""
     i = self.model.site(name).id
     n = self._nsel(ids)
     jacp = np.zeros((n, 3, self.model.nv))
@@ -111,21 +111,19 @@ class Batch(_Batch):
     offsets: np.ndarray,
     ids: Any = None,
     alignment: str = "world",
-    output: str = "height",
   ) -> np.ndarray:
     """Bilinear hfield sampling at XY offsets around a body's origin.
 
     offsets: (npoint, 2), in the sampling grid's frame. alignment rotates the
     grid: "world" keeps offsets in world axes, "yaw" rotates them by the frame
-    body's yaw about world z, "body" by the body's full rotation. output:
-    "height" returns the world z of the sampled hfield surface (the local
-    elevation for an unrotated geom at the origin); "clearance" returns
-    frame_z - sampled_world_z. Returns (nsel, npoint). All simulations sample
-    the template's hfield; a per-sim geom_pos/geom_quat moves the sampling
-    frame. Runs kinematics only, not mj_forward."""
+    body's yaw about world z. Returns (nsel, npoint): the world z of the
+    sampled hfield surface (the local elevation for an unrotated geom at the
+    origin). All simulations sample the template's hfield; a per-sim
+    geom_pos/geom_quat moves the sampling frame. Runs kinematics only, not
+    mj_forward, and does not refresh the bound views."""
     g = self.model.geom(geom).id
     b = self.model.body(body).id
     offsets = np.ascontiguousarray(offsets, dtype=np.float64)
     out = np.zeros((self._nsel(ids), offsets.shape[0]))
-    super().sample_hfield(g, b, offsets, out, ids, alignment, output)
+    super().sample_hfield(g, b, offsets, out, ids, alignment)
     return out

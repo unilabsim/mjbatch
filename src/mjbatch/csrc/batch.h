@@ -291,11 +291,10 @@ struct Scalars {
   }
 };
 
-// SampleHfield grid alignment: offsets stay in world axes (World), rotate with
-// the frame body's yaw about world z (Yaw), or with the frame body's full
-// rotation (Body).  This is the mujoco_uni BatchEnvPool.sample_hfield_height
-// convention, which this op replaces.
-enum class HfieldAlign { World, Yaw, Body };
+// SampleHfield grid alignment: offsets stay in world axes (World) or rotate
+// with the frame body's yaw about world z (Yaw).  This is the mujoco_uni
+// BatchEnvPool.sample_hfield_height convention, which this op replaces.
+enum class HfieldAlign { World, Yaw };
 
 // Per-call context for the query ops (JacSite, SampleHfield): outputs are
 // caller-allocated arrays, one row per selected sim, like step's history.
@@ -307,16 +306,7 @@ struct QueryCtx {
   const mjtNum* offsets = nullptr;  // (npoint, 2) grid-frame XY around the body origin
   int npoint = 0;
   HfieldAlign align = HfieldAlign::World;  // SampleHfield: sampling grid rotation
-  bool clearance = false;                  // SampleHfield: clearance instead of height
   mjtNum* out = nullptr;      // (sel, npoint) rows
-};
-
-// Per-call outputs of Op::Step beyond the copied-out state: optional history
-// rows and per-sim substep counts, plus the warning early-stop switch.
-struct StepCtx {
-  mjtNum* hist = nullptr;     // (sel, nstep, nstate) rows
-  int* steps_done = nullptr;  // (sel,) substeps executed
-  bool stop_on_warning = false;
 };
 
 // One substep of a callback-driven step (Op::Substep): the calling thread
@@ -324,8 +314,7 @@ struct StepCtx {
 // so a sim's state round-trips through its states_ row every substep.
 struct CallbackCtx {
   int k = 0, nstep = 1;
-  const StepCtx* step = nullptr;
-  Slot* sensor = nullptr;   // sensordata slot, copied out every substep when set
+  mjtNum* hist = nullptr;   // (sel, nstep, nstate) row for this sim
   uint8_t* done = nullptr;  // set when this selection row runs its copy-out tail
   bool tail_only = false;   // exception cleanup: no mj_step, copy out where it stopped
 };
@@ -333,16 +322,13 @@ struct CallbackCtx {
 // Bilinear sampling of one hfield geom at XY offsets from a frame body's origin.
 // The offsets form a sampling grid rotated per ctx.align: World keeps them in
 // world axes, Yaw rotates them by the frame body's yaw about world z (extracted
-// from xmat), Body by the frame body's full rotation. Sample points are taken
-// in the plane through the geom center, then transformed into the geom's local
-// frame (its pose comes from the sim's mjData, so per-sim geom_pos/geom_quat
-// apply); the hfield grid itself is the model's, shared by all sims. The grid
-// mapping and clamping match MuJoCo's hfield contact convention for the XY
-// extent [-size[0], size[0]] x [-size[1], size[1]].
-// output=height returns the world z of the sampled surface point (for an
-// unrotated geom at the origin this is the local elevation interp * size[2]);
-// output=clearance returns frame_z - sampled_world_z, the world-z clearance of
-// the body origin above the sampled surface.
+// from xmat). Sample points are taken in the plane through the geom center,
+// then transformed into the geom's local frame (its pose comes from the sim's
+// mjData, so per-sim geom_pos/geom_quat apply); the hfield grid itself is the
+// model's, shared by all sims. The grid mapping and clamping match MuJoCo's
+// hfield contact convention for the XY extent [-size[0], size[0]] x
+// [-size[1], size[1]]. The output is the world z of the sampled surface point
+// (for an unrotated geom at the origin, the local elevation interp * size[2]).
 
 inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx) {
   int hfield = m->geom_dataid[ctx.geom];
@@ -365,12 +351,8 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
     if (ctx.align == HfieldAlign::Yaw) {
       rx = cyaw * ox - syaw * oy;
       ry = syaw * ox + cyaw * oy;
-    } else if (ctx.align == HfieldAlign::Body) {
-      rx = bmat[0] * ox + bmat[1] * oy;
-      ry = bmat[3] * ox + bmat[4] * oy;
     }
-    // All alignments sample in the geom-center plane; Body still tilts the
-    // grid's xy mapping through the full body rotation.
+    // Both alignments sample in the geom-center plane.
     mjtNum wp[3] = {bpos[0] + rx, bpos[1] + ry, gpos[2]};
     mjtNum rel[3], lp[3];
     mju_sub3(rel, wp, gpos);
@@ -388,12 +370,7 @@ inline void SampleHfield(const mjModel* m, const mjData* d, const QueryCtx& ctx)
                sx * sy * data[iy1 * ncol + ix1];
     h *= hsize[2];
     // World z of the surface point above the sample: gpos + gmat @ (lp0, lp1, h).
-    mjtNum surfz = gpos[2] + gmat[6] * lp[0] + gmat[7] * lp[1] + gmat[8] * h;
-    if (ctx.clearance) {
-      ctx.out[k] = bpos[2] - surfz;
-    } else {
-      ctx.out[k] = surfz;
-    }
+    ctx.out[k] = gpos[2] + gmat[6] * lp[0] + gmat[7] * lp[1] + gmat[8] * h;
   }
 }
 
@@ -486,23 +463,18 @@ class Batch {
   }
 
   void step(std::optional<Ids> ids, int nstep, std::optional<nb::ndarray<>> history,
-            std::optional<nb::callable> callback, bool callback_sensordata,
-            std::optional<nb::ndarray<>> steps_done, bool stop_on_warning) {
+            std::optional<nb::callable> callback) {
     ReentryGuard();
     if (nstep < 1) throw nb::value_error("nstep must be >= 1");
     auto sel = Parse(ids);
-    int nsel = sel ? static_cast<int>(sel->size()) : num_sims_;
-    StepCtx ctx;
-    ctx.stop_on_warning = stop_on_warning;
-    if (history) ctx.hist = HistoryPtr(*history, nsel, nstep);
-    if (steps_done) {
-      ctx.steps_done = StepsDonePtr(*steps_done, nsel);
-      std::fill_n(ctx.steps_done, nsel, 0);  // rows of a sim that raises stay defined
+    mjtNum* hist = nullptr;
+    if (history) {
+      hist = HistoryPtr(*history, sel ? static_cast<int>(sel->size()) : num_sims_, nstep);
     }
     if (callback) {
-      RunCallback(std::move(sel), nstep, ctx, *callback, callback_sensordata);
+      RunCallback(std::move(sel), nstep, hist, *callback);
     } else {
-      Run(Op::Step, std::move(sel), nstep, nullptr, &ctx);
+      Run(Op::Step, std::move(sel), nstep, hist);
     }
   }
   void forward(std::optional<Ids> ids) {
@@ -539,7 +511,8 @@ class Batch {
   }
 
   // mj_jacSite per selected sim into caller-allocated (sel, 3, nv) rows; either
-  // output may be omitted. Runs kinematics and comPos only, not mj_forward.
+  // output may be omitted. Runs kinematics and comPos only, not mj_forward, and
+  // does not refresh the bound views: the outputs are the caller-allocated rows.
   void jac_site(int site, std::optional<nb::ndarray<>> jacp,
                 std::optional<nb::ndarray<>> jacr, std::optional<Ids> ids) {
     ReentryGuard();
@@ -553,20 +526,18 @@ class Batch {
     if (!ctx.jacp && !ctx.jacr) {
       throw nb::value_error("jacp and jacr cannot both be None");
     }
-    Run(Op::JacSite, std::move(sel), 0, &ctx);
+    Run(Op::JacSite, std::move(sel), 0, nullptr, &ctx);
   }
 
   // Bilinear hfield sampling per selected sim at XY offsets around a frame
-  // body's origin, into caller-allocated (sel, npoint) rows. Runs kinematics
-  // only. All sims sample the template's hfield; a per-sim geom_pos/geom_quat
-  // moves the sampling frame. alignment rotates the sampling grid: "world"
-  // keeps offsets in world axes, "yaw" rotates them by the frame body's yaw
-  // about world z, "body" by the frame body's full rotation. output: "height"
-  // returns the world z of the sampled hfield surface; "clearance" returns
-  // frame_z - sampled_world_z.
+  // body's origin, into caller-allocated (sel, npoint) rows: the world z of
+  // the sampled hfield surface. Runs kinematics only, not mj_forward, and does
+  // not refresh the bound views. All sims sample the template's hfield; a
+  // per-sim geom_pos/geom_quat moves the sampling frame. alignment rotates the
+  // sampling grid: "world" keeps offsets in world axes, "yaw" rotates them by
+  // the frame body's yaw about world z.
   void sample_hfield(int geom, int body, const nb::ndarray<>& offsets, nb::ndarray<> out,
-                     std::optional<Ids> ids, const std::string& alignment,
-                     const std::string& output) {
+                     std::optional<Ids> ids, const std::string& alignment) {
     ReentryGuard();
     if (geom < 0 || geom >= template_->ngeom) throw nb::value_error("geom out of range");
     if (template_->geom_type[geom] != mjGEOM_HFIELD) {
@@ -578,13 +549,8 @@ class Batch {
       align = HfieldAlign::World;
     } else if (alignment == "yaw") {
       align = HfieldAlign::Yaw;
-    } else if (alignment == "body") {
-      align = HfieldAlign::Body;
     } else {
-      throw nb::value_error("alignment must be \"world\", \"yaw\" or \"body\"");
-    }
-    if (output != "height" && output != "clearance") {
-      throw nb::value_error("output must be \"height\" or \"clearance\"");
+      throw nb::value_error("alignment must be \"world\" or \"yaw\"");
     }
     auto sel = Parse(ids);
     int nsel = sel ? static_cast<int>(sel->size()) : num_sims_;
@@ -593,9 +559,8 @@ class Batch {
     ctx.body = body;
     ctx.offsets = OffsetsPtr(offsets, ctx.npoint);
     ctx.align = align;
-    ctx.clearance = output == "clearance";
     ctx.out = OutPtr(out, nsel, 1, ctx.npoint, "out");
-    Run(Op::SampleHfield, std::move(sel), 0, &ctx);
+    Run(Op::SampleHfield, std::move(sel), 0, nullptr, &ctx);
   }
 
  private:
@@ -746,20 +711,6 @@ class Batch {
     return static_cast<const mjtNum*>(a.data());
   }
 
-  // Validate a caller-allocated (sel,) int32 substep-count output array.
-  int* StepsDonePtr(const nb::ndarray<>& a, int nsel) {
-    if (a.ndim() != 1 || static_cast<int>(a.shape(0)) != nsel) {
-      throw nb::value_error("steps_done must have shape (sel,)");
-    }
-    if (a.dtype() != nb::dtype<int32_t>()) throw nb::value_error("steps_done must be int32");
-    // A size-0 array (an empty selection) is never written, so its stride is
-    // irrelevant; numpy sets it to zero regardless of contiguity.
-    if (a.device_type() != nb::device::cpu::value || (a.size() != 0 && a.stride(0) != 1)) {
-      throw nb::value_error("steps_done must be a C-contiguous CPU array");
-    }
-    return static_cast<int*>(a.data());
-  }
-
   nb::ndarray<nb::numpy> View(const Slot& s) {
     const FieldInfo& f = *s.info;
     size_t shape[3] = {static_cast<size_t>(num_sims_), static_cast<size_t>(f.nr),
@@ -795,7 +746,7 @@ class Batch {
   mjtNum* State(int i) { return states_.data() + static_cast<size_t>(i) * nstate_; }
   mjWarningStat* Warning(int i) { return warnings_.data() + static_cast<size_t>(i) * mjNWARNING; }
 
-  void RunSim(int t, int i, Op op, int arg, const StepCtx* step, const QueryCtx* ctx,
+  void RunSim(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
               const CallbackCtx* cctx) {
     mjModel* m = models_.empty() ? template_ : models_[t];
     mjData* d = data_[t];
@@ -834,29 +785,12 @@ class Batch {
     }
     switch (op) {
       case Op::Step: {
-        int executed = arg;
         for (int k = 0; k < arg; ++k) {
-          int before[mjNWARNING];
-          if (step && step->stop_on_warning) {
-            for (int w = 0; w < mjNWARNING; ++w) before[w] = d->warning[w].number;
-          }
           mj_step(m, d);
-          if (step && step->hist) {
-            mj_getState(m, d, step->hist + static_cast<size_t>(k) * nstate_,
-                        mjSTATE_INTEGRATION);
-          }
-          if (step && step->stop_on_warning) {
-            bool warned = false;
-            for (int w = 0; w < mjNWARNING && !warned; ++w) {
-              warned = d->warning[w].number != before[w];
-            }
-            if (warned) {
-              executed = k + 1;
-              break;
-            }
+          if (hist) {
+            mj_getState(m, d, hist + static_cast<size_t>(k) * nstate_, mjSTATE_INTEGRATION);
           }
         }
-        if (step && step->steps_done) step->steps_done[0] = executed;
         if (forward_) mj_forward(m, d);  // derived fields current with the new state
         break;
       }
@@ -871,29 +805,14 @@ class Batch {
         }
         bool tail = cctx->tail_only;
         if (!cctx->tail_only) {
-          int before[mjNWARNING];
-          if (cctx->step->stop_on_warning) {
-            for (int w = 0; w < mjNWARNING; ++w) before[w] = d->warning[w].number;
-          }
           mj_step(m, d);
-          if (cctx->step->hist) {
-            mj_getState(m, d, cctx->step->hist + static_cast<size_t>(cctx->k) * nstate_,
+          if (cctx->hist) {
+            mj_getState(m, d, cctx->hist + static_cast<size_t>(cctx->k) * nstate_,
                         mjSTATE_INTEGRATION);
           }
           mj_getState(m, d, State(i), mjSTATE_INTEGRATION);
           std::memcpy(Warning(i), d->warning, sizeof(d->warning));
-          if (cctx->sensor) {
-            ToBuf(cctx->sensor->buf.get() + i * cctx->sensor->row, cctx->sensor->info->get(d),
-                  *cctx->sensor);
-          }
-          if (cctx->step->steps_done) cctx->step->steps_done[0] = cctx->k + 1;
-          if (cctx->k + 1 == cctx->nstep) {
-            tail = true;
-          } else if (cctx->step->stop_on_warning) {
-            for (int w = 0; w < mjNWARNING && !tail; ++w) {
-              tail = d->warning[w].number != before[w];
-            }
-          }
+          if (cctx->k + 1 == cctx->nstep) tail = true;
         }
         if (!tail) return;  // mid-rollout: the copy-out tail waits for the last substep
         cctx->done[0] = 1;
@@ -908,15 +827,20 @@ class Batch {
       case Op::Reset:
         mj_forward(m, d);
         break;
+      // The query ops run kinematics only: they do not change the integration
+      // state, so the copy-out tail below is skipped. mjData is shared by every
+      // sim a worker serves, and copying out would leak another sim's stale
+      // derived fields into the bound views; the outputs are the
+      // caller-allocated rows.
       case Op::JacSite:
         mj_kinematics(m, d);
         mj_comPos(m, d);
         mj_jacSite(m, d, ctx->jacp, ctx->jacr, ctx->site);
-        break;
+        return;
       case Op::SampleHfield:
         mj_kinematics(m, d);
         SampleHfield(m, d, *ctx);
-        break;
+        return;
       case Op::SetConst:
         break;
     }
@@ -953,12 +877,12 @@ class Batch {
     return out;
   }
 
-  void Guarded(int t, int i, Op op, int arg, const StepCtx* step, const QueryCtx* ctx,
+  void Guarded(int t, int i, Op op, int arg, mjtNum* hist, const QueryCtx* ctx,
                const CallbackCtx* cctx) {
     std::jmp_buf jb;
     tls_jmp = &jb;
     if (setjmp(jb) == 0) {
-      RunSim(t, i, op, arg, step, ctx, cctx);
+      RunSim(t, i, op, arg, hist, ctx, cctx);
     } else {
       // The sim's state was not written back; the worker's mjData, left
       // mid-call with its stack and arena in use, serves other sims next.
@@ -971,12 +895,12 @@ class Batch {
     tls_jmp = nullptr;
   }
 
-  void Run(Op op, std::optional<std::vector<int>> sel, int arg, const QueryCtx* ctx = nullptr,
-           const StepCtx* step = nullptr) {
+  void Run(Op op, std::optional<std::vector<int>> sel, int arg, mjtNum* hist = nullptr,
+           const QueryCtx* ctx = nullptr) {
     nb::gil_scoped_release release;
     std::lock_guard<std::mutex> lock(mu_);
     error_.clear();
-    RunLocked(op, sel, arg, ctx, step);
+    RunLocked(op, sel, arg, hist, ctx);
     if (!error_.empty()) throw std::runtime_error(error_);
   }
 
@@ -994,11 +918,11 @@ class Batch {
   }
 
   void RunLocked(Op op, const std::optional<std::vector<int>>& sel, int arg,
-                 const QueryCtx* ctx = nullptr, const StepCtx* step = nullptr) {
+                 mjtNum* hist = nullptr, const QueryCtx* ctx = nullptr) {
     const int* p = sel ? sel->data() : nullptr;
     const int n = sel ? static_cast<int>(sel->size()) : num_sims_;
     CheckSleep(p, n);
-    auto fn = [this, op, arg, p, ctx, step](int t, int j) {
+    auto fn = [this, op, arg, p, hist, ctx](int t, int j) {
       QueryCtx row_ctx;
       const QueryCtx* c = nullptr;
       if (ctx) {
@@ -1008,15 +932,8 @@ class Batch {
         if (row_ctx.out) row_ctx.out += static_cast<size_t>(j) * row_ctx.npoint;
         c = &row_ctx;
       }
-      StepCtx row_step;
-      const StepCtx* s = nullptr;
-      if (step) {
-        row_step = *step;
-        if (row_step.hist) row_step.hist += static_cast<size_t>(j) * arg * nstate_;
-        if (row_step.steps_done) row_step.steps_done += j;
-        s = &row_step;
-      }
-      Guarded(t, p ? p[j] : j, op, arg, s, c, nullptr);
+      Guarded(t, p ? p[j] : j, op, arg,
+              hist ? hist + static_cast<size_t>(j) * arg * nstate_ : nullptr, c, nullptr);
     };
     if (pool_->size() == 1) {
       for (int j = 0; j < n; ++j) fn(0, j);
@@ -1026,22 +943,18 @@ class Batch {
   }
 
   // One substep for every selected sim that has not run its copy-out tail yet.
-  void SubstepLocked(const int* p, int n, int k, int nstep, const StepCtx& step, Slot* sensor,
-                     uint8_t* done, bool tail_only) {
+  void SubstepLocked(const int* p, int n, int k, int nstep, mjtNum* hist, uint8_t* done,
+                     bool tail_only) {
     CallbackCtx base;
     base.k = k;
     base.nstep = nstep;
-    base.sensor = sensor;
     base.tail_only = tail_only;
     auto fn = [&](int t, int j) {
       if (done[j]) return;
-      StepCtx row_step = step;
-      if (row_step.hist) row_step.hist += static_cast<size_t>(j) * nstep * nstate_;
-      if (row_step.steps_done) row_step.steps_done += j;
       CallbackCtx row = base;
-      row.step = &row_step;
+      if (hist) row.hist = hist + static_cast<size_t>(j) * nstep * nstate_;
       row.done = done + j;
-      Guarded(t, p ? p[j] : j, Op::Substep, k, &row_step, nullptr, &row);
+      Guarded(t, p ? p[j] : j, Op::Substep, k, nullptr, nullptr, &row);
     };
     if (pool_->size() == 1) {
       for (int j = 0; j < n; ++j) fn(0, j);
@@ -1053,8 +966,8 @@ class Batch {
   // A step with a Python control callback: the calling thread invokes the
   // callback before every substep, with the GIL held and every worker idle so
   // the views it passes are stable, then dispatches the substep to the pool.
-  void RunCallback(std::optional<std::vector<int>> sel, int nstep, const StepCtx& step,
-                   nb::callable callback, bool callback_sensordata) {
+  void RunCallback(std::optional<std::vector<int>> sel, int nstep, mjtNum* hist,
+                   nb::callable callback) {
     {
       // Lock mu_ without the GIL: the callback needs the GIL while mu_ is held,
       // so blocking on mu_ with it could deadlock two callback-driven steps.
@@ -1063,15 +976,10 @@ class Batch {
     }
     std::unique_lock<std::mutex> lock(mu_, std::adopt_lock);
     Slot& ctrl = BoundOrAdd(Field(data_fields_, "ctrl"), false);
-    Slot* sensor =
-        callback_sensordata ? &BoundOrAdd(Field(data_fields_, "sensordata"), false) : nullptr;
     // The views are built once per call, so the callback sees the same live
     // arrays every substep and the loop allocates nothing.
     nb::object state = nb::cast(StateView());
     nb::object ctrl_view = nb::cast(View(ctrl));
-    nb::object sensor_view;
-    if (sensor) sensor_view = nb::cast(View(*sensor));
-    nb::object none = nb::borrow<nb::object>(nb::none());
     const int* p = sel ? sel->data() : nullptr;
     const int n = sel ? static_cast<int>(sel->size()) : num_sims_;
     CheckSleep(p, n);
@@ -1082,7 +990,7 @@ class Batch {
     for (int k = 0; k < nstep && active; ++k) {
       tls_callback = this;
       try {
-        callback(k, state, k == 0 || !sensor ? none : sensor_view, ctrl_view);
+        callback(k, state, ctrl_view);
       } catch (...) {
         pending = std::current_exception();
       }
@@ -1090,7 +998,7 @@ class Batch {
       if (pending) break;
       {
         nb::gil_scoped_release release;
-        SubstepLocked(p, n, k, nstep, step, sensor, done.data(), false);
+        SubstepLocked(p, n, k, nstep, hist, done.data(), false);
       }
       ++dispatched;
       if (!error_.empty()) break;
@@ -1100,7 +1008,7 @@ class Batch {
     if ((pending || !error_.empty()) && dispatched) {
       // Sims stopped at their last completed substep; copy out where they are.
       nb::gil_scoped_release release;
-      SubstepLocked(p, n, 0, nstep, step, sensor, done.data(), true);
+      SubstepLocked(p, n, 0, nstep, hist, done.data(), true);
     }
     if (pending) std::rethrow_exception(pending);
     if (!error_.empty()) throw std::runtime_error(error_);
