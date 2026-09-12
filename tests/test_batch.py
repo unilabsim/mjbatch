@@ -493,7 +493,7 @@ def test_step_matches_reference(model, num_threads):
     np.testing.assert_array_equal(sensordata[i], d.sensordata)
   if sys.platform == "linux":
     # Pinning workers to CPUs must not change the numerics bit for bit.
-    cpus = sorted(os.sched_getaffinity(0))[:num_threads]
+    cpus = sorted(os.sched_getaffinity(0))[:num_threads]  # pyright: ignore[reportAttributeAccessIssue]
     pinned = Batch(model, N, cpu_ids=cpus)
     pinned.bind("ctrl")[:] = ctrl
     for _ in range(25):
@@ -505,7 +505,7 @@ def test_step_matches_reference(model, num_threads):
 
 @pytest.mark.skipif(sys.platform != "linux", reason="cpu_ids pinning is Linux-only")
 def test_cpu_ids_pins_workers(model):
-  cpus = sorted(os.sched_getaffinity(0))[:3]
+  cpus = sorted(os.sched_getaffinity(0))[:3]  # pyright: ignore[reportAttributeAccessIssue]
   batch = Batch(model, N, cpu_ids=cpus)
   assert batch.num_threads == len(cpus)
   # An explicit num_threads equal to the length is accepted too.
@@ -521,7 +521,7 @@ def test_cpu_ids_pins_workers(model):
   masks = set()
   for tid in os.listdir("/proc/self/task"):
     try:
-      masks.add(frozenset(os.sched_getaffinity(int(tid))))
+      masks.add(frozenset(os.sched_getaffinity(int(tid))))  # pyright: ignore[reportAttributeAccessIssue]
     except (ProcessLookupError, PermissionError):
       continue
   assert {frozenset({cpu}) for cpu in cpus} <= masks
@@ -529,7 +529,7 @@ def test_cpu_ids_pins_workers(model):
 
 @pytest.mark.skipif(sys.platform != "linux", reason="cpu_ids pinning is Linux-only")
 def test_cpu_ids_validation(model):
-  cpus = sorted(os.sched_getaffinity(0))
+  cpus = sorted(os.sched_getaffinity(0))  # pyright: ignore[reportAttributeAccessIssue]
   outside = next(cpu for cpu in range(4096) if cpu not in cpus)
   with pytest.raises(ValueError, match="not available"):
     Batch(model, N, cpu_ids=[outside])
