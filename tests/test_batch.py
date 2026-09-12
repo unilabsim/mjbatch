@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import os
 import subprocess
 import sys
 import threading
@@ -93,7 +94,7 @@ def model():
   return mujoco.MjModel.from_xml_string(XML)
 
 
-def lockstep(nstep, num_threads, heavy=()):
+def lockstep(nstep, num_threads, heavy=(), use_callback=False):
   model = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
   models = [model] * N
   batch = Batch(model, N, num_threads=num_threads)
@@ -139,7 +140,15 @@ def lockstep(nstep, num_threads, heavy=()):
         apply(i)
         mujoco.mj_forward(models[i], datas[i])
     else:
-      batch.step(None if len(ids) == N else np.array(ids), nstep=nstep)
+      if use_callback:
+        ctrl_now = batch.bind("ctrl").copy()
+
+        def apply_ctrl(k, state, ctrl, value=ctrl_now):
+          ctrl[:] = value
+
+        batch.step(None if len(ids) == N else np.array(ids), nstep=nstep, callback=apply_ctrl)
+      else:
+        batch.step(None if len(ids) == N else np.array(ids), nstep=nstep)
       for i in ids:
         apply(i)
         for _ in range(nstep):
@@ -157,6 +166,112 @@ def test_lockstep_with_mj_step(nstep, num_threads):
 @pytest.mark.parametrize("nstep", [1, 3])
 def test_lockstep_with_expanded_mass(nstep):
   lockstep(nstep, num_threads=4, heavy=(1, 2, 5))
+
+
+@pytest.mark.parametrize("nstep", [1, 3])
+@pytest.mark.parametrize("num_threads", [1, 3])
+def test_lockstep_with_callback(nstep, num_threads):
+  lockstep(nstep, num_threads, use_callback=True)
+
+
+@pytest.mark.parametrize("nstep", [1, 3])
+def test_lockstep_with_callback_and_expanded_mass(nstep):
+  lockstep(nstep, num_threads=4, heavy=(1, 2, 5), use_callback=True)
+
+
+@pytest.mark.parametrize("num_threads", [1, 4])
+def test_step_callback_matches_a_python_loop(num_threads):
+  # A callback-driven rollout against step(nstep=1) calls applying the same
+  # per-substep controls, compared bit for bit.
+  model = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  batch, ref = Batch(model, N, num_threads=num_threads), Batch(model, N, num_threads=3)
+  fields = ("state", "qpos", "qvel", "act", "time", "sensordata", "site_xpos")
+  bound = {f: batch.bind(f) for f in fields}
+  reference = {f: ref.bind(f) for f in fields}
+  nstep = 6
+  rng = np.random.default_rng(1)
+  ctrls = rng.uniform(-1, 1, (nstep, N, model.nu))
+  seen = []
+
+  def apply_ctrl(k, state, ctrl):
+    seen.append(state.copy())
+    ctrl[:] = ctrls[k]
+
+  initial = batch.bind("state").copy()
+  history = np.empty((N, nstep, batch.nstate))
+  batch.step(nstep=nstep, history=history, callback=apply_ctrl)
+  assert len(seen) == nstep
+  np.testing.assert_array_equal(seen[0], initial)  # k=0: the state before the call
+  for k in range(nstep):
+    ref.bind("ctrl")[:] = ctrls[k]
+    ref.step()
+    np.testing.assert_array_equal(history[:, k], reference["state"])
+    if k + 1 < nstep:  # the state view at k + 1 reflects substep k
+      np.testing.assert_array_equal(seen[k + 1], reference["state"])
+  for field in fields:
+    np.testing.assert_array_equal(bound[field], reference[field], field)
+
+
+@pytest.mark.parametrize("num_threads", [1, 3])
+def test_step_callback_error_keeps_completed_substeps(model, num_threads):
+  batch = Batch(model, N, num_threads=num_threads)
+  ctrl, qpos, time = batch.bind("ctrl"), batch.bind("qpos"), batch.bind("time")
+
+  def cb(k, state, ctrl_view):
+    ctrl_view[:] = 0.5
+    if k == 2:
+      raise ValueError("boom")
+
+  with pytest.raises(ValueError, match="boom"):
+    batch.step(nstep=6, callback=cb)
+  # Two substeps completed; the batch stopped there, consistent and recoverable.
+  np.testing.assert_allclose(time, 2 * 0.002)
+  np.testing.assert_array_equal(ctrl, 0.5)
+  data = mujoco.MjData(model)
+  data.ctrl[:] = 0.5
+  for _ in range(2):
+    mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(qpos, np.tile(data.qpos, (N, 1)))
+  batch.step()
+  mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(qpos, np.tile(data.qpos, (N, 1)))
+  np.testing.assert_allclose(time, 3 * 0.002)
+
+
+def test_step_callback_is_not_reentrant(model):
+  batch = Batch(model, N, num_threads=2)
+  time = batch.bind("time")
+  errors = []
+
+  def cb(k, state, ctrl):
+    for call in (lambda: batch.step(), lambda: batch.forward(), lambda: batch.bind("qpos")):
+      try:
+        call()
+      except RuntimeError as e:
+        errors.append(str(e))
+
+  batch.step(nstep=2, callback=cb)
+  assert len(errors) == 6
+  assert all("callback" in e for e in errors)
+  np.testing.assert_allclose(time, 2 * 0.002)  # the outer step completed
+
+
+def test_step_callback_initial_state(model):
+  batch, ref = Batch(model, N), Batch(model, N)
+  for b in (batch, ref):
+    b.bind("ctrl")[:] = 0.3
+    b.step(nstep=2)
+  seen = []
+
+  def cb(k, state, ctrl):
+    seen.append(state.copy())
+
+  initial = batch.bind("state").copy()
+  batch.step(nstep=3, callback=cb)
+  np.testing.assert_array_equal(seen[0], initial)  # k=0: the state before the call
+  for k in (1, 2):
+    ref.step()
+    np.testing.assert_array_equal(seen[k], ref.bind("state"))
 
 
 def test_sleep_is_rejected():
@@ -376,6 +491,62 @@ def test_step_matches_reference(model, num_threads):
     np.testing.assert_array_equal(qpos[i], d.qpos)
     np.testing.assert_array_equal(qvel[i], d.qvel)
     np.testing.assert_array_equal(sensordata[i], d.sensordata)
+  if sys.platform == "linux":
+    # Pinning workers to CPUs must not change the numerics bit for bit.
+    cpus = sorted(os.sched_getaffinity(0))[:num_threads]
+    pinned = Batch(model, N, cpu_ids=cpus)
+    pinned.bind("ctrl")[:] = ctrl
+    for _ in range(25):
+      pinned.step()
+    pinned.step(nstep=25)
+    assert pinned.num_threads == len(cpus)
+    np.testing.assert_array_equal(pinned.bind("state"), batch.bind("state"))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="cpu_ids pinning is Linux-only")
+def test_cpu_ids_pins_workers(model):
+  cpus = sorted(os.sched_getaffinity(0))[:3]
+  batch = Batch(model, N, cpu_ids=cpus)
+  assert batch.num_threads == len(cpus)
+  # An explicit num_threads equal to the length is accepted too.
+  assert Batch(model, N, num_threads=len(cpus), cpu_ids=cpus).num_threads == len(cpus)
+  ctrl = batch.bind("ctrl")
+  ctrl[:, 0] = np.linspace(-1, 1, N)
+  qpos = batch.bind("qpos")
+  batch.step(nstep=5)
+  for i, d in enumerate(reference(model, ctrl, 5)):
+    np.testing.assert_array_equal(qpos[i], d.qpos)
+  # Every worker's affinity mask is exactly its one pinned CPU, read back
+  # through the per-thread view of sched_getaffinity.
+  masks = set()
+  for tid in os.listdir("/proc/self/task"):
+    try:
+      masks.add(frozenset(os.sched_getaffinity(int(tid))))
+    except (ProcessLookupError, PermissionError):
+      continue
+  assert {frozenset({cpu}) for cpu in cpus} <= masks
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="cpu_ids pinning is Linux-only")
+def test_cpu_ids_validation(model):
+  cpus = sorted(os.sched_getaffinity(0))
+  outside = next(cpu for cpu in range(4096) if cpu not in cpus)
+  with pytest.raises(ValueError, match="not available"):
+    Batch(model, N, cpu_ids=[outside])
+  with pytest.raises(ValueError, match="unique"):
+    Batch(model, N, cpu_ids=[cpus[0], cpus[0]])
+  with pytest.raises(ValueError, match="non-empty"):
+    Batch(model, N, cpu_ids=[])
+  with pytest.raises(ValueError, match=r">= 0"):
+    Batch(model, N, cpu_ids=[-1])
+  with pytest.raises(ValueError, match="num_threads"):
+    Batch(model, N, num_threads=len(cpus) + 1, cpu_ids=cpus)
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="Linux accepts cpu_ids")
+def test_cpu_ids_rejected_off_linux(model):
+  with pytest.raises(ValueError, match="only supported on Linux"):
+    Batch(model, N, cpu_ids=[0])
 
 
 def test_forward_after_step(model):
@@ -751,3 +922,166 @@ def test_sample_hfield_matches_reference():
     raw.sample_hfield(geom, 99, offsets, np.zeros((2, len(offsets))))
   with pytest.raises(ValueError, match="offsets"):
     raw.sample_hfield(geom, body, np.zeros(3), np.zeros((2, 3)))
+
+
+# A hfield geom away from the origin with its own rotation, so its pose moves
+# the sampling frame; the cart is a free body, so its yaw drives the grid.
+HFIELD_ROT_XML = """
+<mujoco>
+  <asset>
+    <hfield name="hf" nrow="9" ncol="9" size="1 1 0.5 0.1"/>
+  </asset>
+  <worldbody>
+    <geom name="terrain" type="hfield" hfield="hf" pos="0.3 -0.2 0.1"/>
+    <body name="cart" pos="0 0 0.2">
+      <freejoint name="root"/>
+      <geom type="sphere" size=".05" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def _rot_hfield_model():
+  model = mujoco.MjModel.from_xml_string(HFIELD_ROT_XML)
+  nrow, ncol = model.hfield_nrow[0], model.hfield_ncol[0]
+  model.hfield_data[: nrow * ncol] = np.linspace(0, 1, nrow * ncol)  # known ramp
+  return model
+
+
+def _place_cart(rng, qpos):
+  """Randomize the cart's planar position, with pure-yaw rotations."""
+  qpos[:, 0:2] += rng.uniform(-0.5, 0.5, (qpos.shape[0], 2))
+  yaw = rng.uniform(-np.pi, np.pi, qpos.shape[0])
+  qpos[:, 3:7] = np.stack([np.cos(yaw / 2), np.zeros_like(yaw), np.zeros_like(yaw), np.sin(yaw / 2)], axis=1)
+
+
+def test_sample_hfield_yaw_alignment():
+  model = _rot_hfield_model()
+  geom, body = model.geom("terrain").id, model.body("cart").id
+  batch = Batch(model, N, num_threads=3)
+  rng = np.random.default_rng(2)
+  qpos = batch.bind("qpos")
+  qpos[:] = model.qpos0
+  _place_cart(rng, qpos)
+  # A per-sim terrain orientation through expanded geom_quat moves the
+  # sampling frame; the grid itself follows the cart's yaw.
+  quat = batch.expand("geom_quat")
+  tq = rng.normal(size=(N, 4))
+  quat[:, geom] = tq / np.linalg.norm(tq, axis=1, keepdims=True)
+  offsets = np.array([[i * 0.06, j * 0.06] for i in (-1, 0, 1) for j in (-1, 0, 1)])
+  out = batch.sample_hfield("terrain", "cart", offsets, alignment="yaw")
+  assert out.shape == (N, len(offsets))
+  for i in range(N):
+    model.geom_quat[geom] = quat[i, geom]
+    ref = _ref_hfield_yaw(model, qpos[i], geom, body, offsets)
+    np.testing.assert_allclose(out[i], ref, rtol=1e-7, atol=1e-12)
+  # Subset rows follow the selection.
+  ids = np.array([2, 6])
+  sub = batch.sample_hfield("terrain", "cart", offsets, ids=ids, alignment="yaw")
+  np.testing.assert_allclose(sub, out[ids])
+
+
+def _ref_hfield_yaw(model, qpos_row, geom, body, offsets):
+  d = mujoco.MjData(model)
+  d.qpos[:] = qpos_row
+  mujoco.mj_forward(model, d)
+  hfield = model.geom_dataid[geom]
+  nrow, ncol = model.hfield_nrow[hfield], model.hfield_ncol[hfield]
+  size = model.hfield_size[hfield]
+  data = model.hfield_data[hfield * nrow * ncol : (hfield + 1) * nrow * ncol].reshape(nrow, ncol)
+  gpos, gmat = d.geom_xpos[geom], d.geom_xmat[geom].reshape(3, 3)
+  bpos = d.xpos[body]
+  bmat = d.xmat[body].reshape(3, 3)
+  out = np.zeros(len(offsets))
+  for k, (ox, oy) in enumerate(offsets):
+    yaw = np.arctan2(bmat[1, 0], bmat[0, 0])
+    c, s = np.cos(yaw), np.sin(yaw)
+    r = np.array([c * ox - s * oy, s * ox + c * oy, 0.0])
+    w = bpos + r
+    w[2] = gpos[2]  # the grid samples in the geom-center plane
+    lp = gmat.T @ (w - gpos)
+    fx = np.clip((lp[0] / size[0] + 1.0) * 0.5 * (ncol - 1), 0, ncol - 1.001)
+    fy = np.clip((lp[1] / size[1] + 1.0) * 0.5 * (nrow - 1), 0, nrow - 1.001)
+    ix, iy = int(fx), int(fy)
+    sx, sy = fx - ix, fy - iy
+    h = (
+      (1 - sx) * (1 - sy) * data[iy, ix]
+      + sx * (1 - sy) * data[iy, min(ix + 1, ncol - 1)]
+      + (1 - sx) * sy * data[min(iy + 1, nrow - 1), ix]
+      + sx * sy * data[min(iy + 1, nrow - 1), min(ix + 1, ncol - 1)]
+    ) * size[2]
+    out[k] = gpos[2] + (gmat @ np.array([lp[0], lp[1], h]))[2]
+  return out
+
+
+def test_sample_hfield_alignment_errors():
+  model = _rot_hfield_model()
+  geom, body = model.geom("terrain").id, model.body("cart").id
+  offsets = np.zeros((3, 2))
+  batch = Batch(model, 2)
+  with pytest.raises(ValueError, match="alignment"):
+    batch.sample_hfield("terrain", "cart", offsets, alignment="diagonal")
+  from mjbatch._bindings import Batch as RawBatch
+
+  raw = RawBatch(model, 2)
+  with pytest.raises(ValueError, match="alignment"):
+    raw.sample_hfield(geom, body, offsets, np.zeros((2, 3)), None, "diagonal")
+  # Default is world: the same call spelled out matches the default.
+  default = batch.sample_hfield("terrain", "cart", offsets)
+  spelled = batch.sample_hfield("terrain", "cart", offsets, alignment="world")
+  np.testing.assert_array_equal(default, spelled)
+
+
+# A hfield, a site and a sensor on one model, so both query ops and a derived
+# bound field are exercised together.
+QUERY_XML = """
+<mujoco>
+  <asset>
+    <hfield name="hf" nrow="9" ncol="9" size="1 1 0.5 0.1"/>
+  </asset>
+  <worldbody>
+    <geom name="terrain" type="hfield" hfield="hf"/>
+    <body name="cart" pos="0 0 0.2">
+      <joint name="x" type="slide" axis="1 0 0"/>
+      <joint name="y" type="slide" axis="0 1 0"/>
+      <geom type="sphere" size=".05" mass="1"/>
+      <site name="base"/>
+    </body>
+  </worldbody>
+  <sensor><jointpos joint="x"/><jointpos joint="y"/></sensor>
+</mujoco>
+"""
+
+
+def test_query_ops_do_not_refresh_bound_views():
+  # The query ops run mj_kinematics only and skip the bound-field copy-out:
+  # their outputs are the caller-allocated rows, and the bound views stay
+  # byte-identical across a query call. The worker's shared mjData holds
+  # another sim's stale derived fields, which must not leak into the views.
+  model = mujoco.MjModel.from_xml_string(QUERY_XML)
+  nrow, ncol = model.hfield_nrow[0], model.hfield_ncol[0]
+  model.hfield_data[: nrow * ncol] = np.linspace(0, 1, nrow * ncol)  # known ramp
+  batch = Batch(model, N, num_threads=2)
+  qpos, sensordata = batch.bind("qpos"), batch.bind("sensordata")
+  rng = np.random.default_rng(5)
+  qpos[:] = model.qpos0 + rng.uniform(-0.5, 0.5, (N, model.nq))
+  batch.step(nstep=3)
+  qpos_before, sensordata_before = qpos.copy(), sensordata.copy()
+  offsets = np.array([[0.0, 0.0], [0.12, -0.06], [-0.24, 0.18]])
+  jacp, jacr = batch.jac_site("base")
+  out = batch.sample_hfield("terrain", "cart", offsets)
+  np.testing.assert_array_equal(qpos, qpos_before)
+  np.testing.assert_array_equal(sensordata, sensordata_before)
+  # The query results are unchanged: checked against serial references.
+  geom, body, site = (model.geom("terrain").id, model.body("cart").id, model.site("base").id)
+  for i in range(N):
+    d = mujoco.MjData(model)
+    d.qpos[:] = qpos_before[i]
+    mujoco.mj_kinematics(model, d)
+    mujoco.mj_comPos(model, d)
+    jp, jr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+    mujoco.mj_jacSite(model, d, jp, jr, site)
+    np.testing.assert_array_equal(jacp[i], jp)
+    np.testing.assert_array_equal(jacr[i], jr)
+    np.testing.assert_allclose(out[i], _ref_hfield(model, qpos_before[i], geom, body, offsets))
