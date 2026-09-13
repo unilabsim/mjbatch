@@ -325,19 +325,19 @@ def _validate_shared_parameters(
 ) -> None:
   """Reject shared parameter changes that a canonical executor cannot represent."""
 
+  shared_names = tuple(
+    name
+    for name in dir(canonical)
+    if name.startswith(_SHARED_PARAMETER_PREFIXES)
+    and name not in _IGNORED_COMPILER_FLAGS
+    and not name.startswith(_IGNORED_COMPILER_METADATA_PREFIXES)
+    and name not in _ALLOWED_BODY_FIELDS
+    and name not in _ALLOWED_DOF_FIELDS
+    and name not in _ALLOWED_GEOM_FIELDS
+    and name not in _ALLOWED_DERIVED_FIELDS
+  )
   for variant, (reference, geom_map) in enumerate(zip(references, geom_maps, strict=True)):
-    for name in dir(canonical):
-      if not name.startswith(_SHARED_PARAMETER_PREFIXES):
-        continue
-      if (
-        name in _IGNORED_COMPILER_FLAGS
-        or name.startswith(_IGNORED_COMPILER_METADATA_PREFIXES)
-        or name in _ALLOWED_BODY_FIELDS
-        or name in _ALLOWED_DOF_FIELDS
-        or name in _ALLOWED_GEOM_FIELDS
-        or name in _ALLOWED_DERIVED_FIELDS
-      ):
-        continue
+    for name in shared_names:
       expected = getattr(canonical, name, None)
       actual = getattr(reference, name, None)
       if not isinstance(expected, np.ndarray) or not isinstance(actual, np.ndarray):
@@ -353,10 +353,11 @@ def _validate_shared_options(
   references: Sequence[mujoco.MjModel],
   canonical: mujoco.MjModel,
 ) -> None:
+  option_names = tuple(
+    name for name in dir(canonical.opt) if not name.startswith("_") and name != "timestep"
+  )
   for variant, reference in enumerate(references):
-    for name in dir(canonical.opt):
-      if name.startswith("_") or name == "timestep":
-        continue
+    for name in option_names:
       expected = getattr(canonical.opt, name, None)
       actual = getattr(reference.opt, name, None)
       if isinstance(expected, np.ndarray) and isinstance(actual, np.ndarray):
