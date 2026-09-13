@@ -3,13 +3,16 @@ requires = ["scikit-build-core>=1.0", "nanobind>=2.2.0", "mujoco==3.11.0"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "mjbatch"
+name = "mjbatch-uni"
 version = "0.1.0"
-description = "A Python library for running thousands of MuJoCo simulations in parallel on CPU."
+description = "A Python library for running thousands of MuJoCo simulations in parallel on CPU (unilabsim fork)."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{ name = "Kevin Zakka", email = "zakka@berkeley.edu" }]
+authors = [
+  { name = "Kevin Zakka", email = "zakka@berkeley.edu" },
+  { name = "Yufei Jia", email = "jyf23@mails.tsinghua.edu.cn" },
+]
 keywords = ["mujoco", "physics", "simulation", "batched", "reinforcement-learning"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -30,9 +33,9 @@ requires-python = ">=3.10"
 dependencies = ["mujoco==3.11.0", "numpy"]
 
 [project.urls]
-Homepage = "https://github.com/kevinzakka/mjbatch"
-Repository = "https://github.com/kevinzakka/mjbatch"
-Issues = "https://github.com/kevinzakka/mjbatch/issues"
+Homepage = "https://github.com/unilabsim/mjbatch_uni"
+Repository = "https://github.com/unilabsim/mjbatch_uni"
+Issues = "https://github.com/unilabsim/mjbatch_uni/issues"
 
 [dependency-groups]
 dev = ["pytest", "ruff", "pyright", "nanobind>=2.2.0"]
@@ -75,11 +78,10 @@ extra-paths = ["typings"]
 testpaths = ["tests"]
 
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+build = "cp310-* cp311-* cp312-* cp313-*"
 # Windows: the mujoco wheel ships mujoco.dll with no import library, and the
 # extension finds libmujoco by rpath, which Windows has no equivalent of.
 skip = "*-musllinux_* *-win* *_i686"
-enable = ["cpython-freethreading"]
 test-requires = "pytest"
 test-command = "pytest {project}/tests"
 

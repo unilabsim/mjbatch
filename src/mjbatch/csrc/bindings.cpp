@@ -3,6 +3,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "batch.h"
 
@@ -61,10 +62,13 @@ mj_setConst on one model. A MuJoCo error on a worker raises RuntimeError naming
 the first failing simulation; the others still ran, and the failing one keeps the
 state it had before the call, its writes still pending. The trap is a MuJoCo log
 handler installed at import; installing another handler later disables it.)")
-      .def(nb::init<nb::object, int, int, bool>(), "model"_a, "num_sims"_a, "num_threads"_a = 0,
-           "forward"_a = false,
+      .def(nb::init<nb::object, int, int, bool, std::optional<std::vector<int>>>(), "model"_a,
+           "num_sims"_a, "num_threads"_a = 0, "forward"_a = false, "cpu_ids"_a = nb::none(),
            "num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends "
-           "every step with mj_forward, so derived fields are current with the state.")
+           "every step with mj_forward, so derived fields are current with the state. "
+           "cpu_ids (Linux only) pins worker i to cpu_ids[i]; its length sets num_threads "
+           "when that is 0 and must equal it otherwise, and passing it on another "
+           "platform raises ValueError.")
       .def_prop_ro("num_sims", &Batch::num_sims)
       .def_prop_ro("num_threads", &Batch::num_threads)
       .def_prop_ro("nstate", &Batch::nstate, "The length of a simulation's integration state.")
@@ -72,11 +76,19 @@ handler installed at import; installing another handler later disables it.)")
            "dtype is the field's own or float32 for mjtNum fields.")
       .def("expand", &Batch::expand, "name"_a, "dtype"_a = nb::none())
       .def("step", &Batch::step, "ids"_a.noconvert() = nb::none(), "nstep"_a = 1,
-           "history"_a.noconvert() = nb::none(),
+           "history"_a.noconvert() = nb::none(), nb::kw_only(), "callback"_a = nb::none(),
            "nstep mj_step calls per simulation, on one worker. ids: sorted unique ints or a "
            "bool mask. history: an optional caller-allocated (sims, nstep, nstate) array "
            "filled with each selected simulation's state after every substep, in "
-           "bind(\"state\") order; the rows of a simulation that raises are undefined.")
+           "bind(\"state\") order; the rows of a simulation that raises are undefined.\n"
+           "callback: fn(k, state, ctrl) invoked on the calling thread before substep k. "
+           "k=0 gets the state from before the call; a later k gets the state after "
+           "substep k-1. The views are live (num_sims, ...) batch rows built once per "
+           "call: writes to ctrl apply to the substep that follows, writes to state at "
+           "the next substep, like a state write between calls. Substeps are dispatched "
+           "one at a time, so bound fields other than state stay stale until the call "
+           "ends. Batch calls from inside the callback raise; an exception stops the "
+           "simulations at the last completed substep, recoverably.")
       .def("forward", &Batch::forward, "ids"_a.noconvert() = nb::none())
       .def("reset", &Batch::reset, "ids"_a.noconvert() = nb::none(), "keyframe"_a = -1,
            "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.")
@@ -84,12 +96,18 @@ handler installed at import; installing another handler later disables it.)")
            "jacr"_a.noconvert() = nb::none(), "ids"_a.noconvert() = nb::none(),
            "mj_jacSite per selected simulation into caller-allocated (sel, 3, nv) rows; "
            "either output may be None. Runs mj_kinematics and mj_comPos only, not "
-           "mj_forward, so bound derived fields are refreshed to kinematics level.")
+           "mj_forward, and does not refresh the bound views: the outputs are the "
+           "caller-allocated rows.")
       .def("sample_hfield", &Batch::sample_hfield, "geom"_a, "body"_a,
            "offsets"_a.noconvert(), "out"_a.noconvert(), "ids"_a.noconvert() = nb::none(),
-           "Bilinear hfield heights per selected simulation at world-frame XY offsets "
-           "around a frame body's origin, into caller-allocated (sel, npoint) rows. Runs "
-           "mj_kinematics only. All simulations sample the template's hfield; a per-sim "
-           "geom_pos moves the sampling frame.")
+           "alignment"_a = "world",
+           "Bilinear hfield sampling per selected simulation at XY offsets around a frame "
+           "body's origin, into caller-allocated (sel, npoint) rows: the world z of the "
+           "sampled hfield surface (the local elevation for an unrotated geom at the "
+           "origin). alignment rotates the sampling grid: \"world\" keeps offsets in "
+           "world axes, \"yaw\" rotates them by the frame body's yaw about world z. Runs "
+           "mj_kinematics only, not mj_forward, and does not refresh the bound views. All "
+           "simulations sample the template's hfield; a per-sim geom_pos or geom_quat "
+           "moves the sampling frame.")
       .def("set_const", &Batch::set_const, "ids"_a.noconvert() = nb::none());
 }

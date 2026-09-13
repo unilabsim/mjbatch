@@ -917,7 +917,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mjbatch"
+name = "mjbatch-uni"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

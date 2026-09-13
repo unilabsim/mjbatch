@@ -1,3 +1,4 @@
+from collections.abc import Callable, Sequence
 from typing import Annotated
 
 from numpy.typing import NDArray
@@ -50,9 +51,9 @@ class Batch:
     handler installed at import; installing another handler later disables it.
     """
 
-    def __init__(self, model: object, num_sims: int, num_threads: int = 0, forward: bool = False) -> None:
+    def __init__(self, model: object, num_sims: int, num_threads: int = 0, forward: bool = False, cpu_ids: Sequence[int] | None = None) -> None:
         """
-        num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends every step with mj_forward, so derived fields are current with the state.
+        num_threads=0 uses every logical CPU, clamped to num_sims. forward=True ends every step with mj_forward, so derived fields are current with the state. cpu_ids (Linux only) pins worker i to cpu_ids[i]; its length sets num_threads when that is 0 and must equal it otherwise, and passing it on another platform raises ValueError.
         """
 
     @property
@@ -70,9 +71,10 @@ class Batch:
 
     def expand(self, name: str, dtype: object | None = None) -> NDArray: ...
 
-    def step(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, nstep: int = 1, history: NDArray | None = None) -> None:
+    def step(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, nstep: int = 1, history: NDArray | None = None, *, callback: Callable | None = None) -> None:
         """
         nstep mj_step calls per simulation, on one worker. ids: sorted unique ints or a bool mask. history: an optional caller-allocated (sims, nstep, nstate) array filled with each selected simulation's state after every substep, in bind("state") order; the rows of a simulation that raises are undefined.
+        callback: fn(k, state, ctrl) invoked on the calling thread before substep k. k=0 gets the state from before the call; a later k gets the state after substep k-1. The views are live (num_sims, ...) batch rows built once per call: writes to ctrl apply to the substep that follows, writes to state at the next substep, like a state write between calls. Substeps are dispatched one at a time, so bound fields other than state stay stale until the call ends. Batch calls from inside the callback raise; an exception stops the simulations at the last completed substep, recoverably.
         """
 
     def forward(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...
@@ -84,12 +86,12 @@ class Batch:
 
     def jac_site(self, site: int, jacp: NDArray | None = None, jacr: NDArray | None = None, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None:
         """
-        mj_jacSite per selected simulation into caller-allocated (sel, 3, nv) rows; either output may be None. Runs mj_kinematics and mj_comPos only, not mj_forward, so bound derived fields are refreshed to kinematics level.
+        mj_jacSite per selected simulation into caller-allocated (sel, 3, nv) rows; either output may be None. Runs mj_kinematics and mj_comPos only, not mj_forward, and does not refresh the bound views: the outputs are the caller-allocated rows.
         """
 
-    def sample_hfield(self, geom: int, body: int, offsets: NDArray, out: NDArray, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None:
+    def sample_hfield(self, geom: int, body: int, offsets: NDArray, out: NDArray, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, alignment: str = 'world') -> None:
         """
-        Bilinear hfield heights per selected simulation at world-frame XY offsets around a frame body's origin, into caller-allocated (sel, npoint) rows. Runs mj_kinematics only. All simulations sample the template's hfield; a per-sim geom_pos moves the sampling frame.
+        Bilinear hfield sampling per selected simulation at XY offsets around a frame body's origin, into caller-allocated (sel, npoint) rows: the world z of the sampled hfield surface (the local elevation for an unrotated geom at the origin). alignment rotates the sampling grid: "world" keeps offsets in world axes, "yaw" rotates them by the frame body's yaw about world z. Runs mj_kinematics only, not mj_forward, and does not refresh the bound views. All simulations sample the template's hfield; a per-sim geom_pos or geom_quat moves the sampling frame.
         """
 
     def set_const(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...

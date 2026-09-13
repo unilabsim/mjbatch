@@ -1,9 +1,9 @@
-# mjbatch
+# mjbatch-uni
 
-[![Build](https://img.shields.io/github/actions/workflow/status/kevinzakka/mjbatch/ci.yml?branch=main)](https://github.com/kevinzakka/mjbatch/actions)
-[![PyPI version](https://img.shields.io/pypi/v/mjbatch)](https://pypi.org/project/mjbatch/)
+[![Build](https://img.shields.io/github/actions/workflow/status/unilabsim/mjbatch_uni/ci.yml?branch=main)](https://github.com/unilabsim/mjbatch_uni/actions)
+[![PyPI version](https://img.shields.io/pypi/v/mjbatch-uni)](https://pypi.org/project/mjbatch-uni/)
 
-`mjbatch` is a Python library for running thousands of MuJoCo simulations in parallel on CPU.
+`mjbatch-uni` is a Python library for running thousands of MuJoCo simulations in parallel on CPU.
 
 Features include:
 
@@ -12,7 +12,9 @@ Features include:
 * Per-simulation model parameters, with `expand` for MjModel fields and `set_const` to recompute derived constants.
 * Same-layout compiler-coherent mesh variants, with `VariantPack.from_specs()` and `Batch.from_variant_pack()`.
 * Explicit topology-affine groups, with `ModelAffineBatch` routing global ids to incompatible layouts.
-* Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield`.
+* Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield` (world/yaw grid alignment); query ops return caller-allocated results without refreshing the bound views.
+* Per-substep control from Python with `step(..., callback=...)`.
+* Optional per-worker CPU pinning on Linux, with `cpu_ids` binding pool worker `i` to `cpu_ids[i]`.
 
 For example:
 
@@ -76,6 +78,11 @@ Reproducible cold-start, RSS, stepping, and model-field-update measurements:
 uv run python benchmarks/topology_groups.py --num-sims 512 --threads 4
 ```
 
+`sample_hfield` samples a shared heightfield at XY offsets around a body origin,
+returning the world z of the sampled surface. `alignment="yaw"` rotates the
+sampling grid by the frame body's yaw about world z, so a per-sim `geom_quat`
+rotates each simulation's scan pattern.
+
 ## Examples
 
 We showcase a range of applications built using `mjbatch`: RL, MPC, SysID, and hardware
@@ -85,10 +92,10 @@ RL controller learns to walk in under a minute on a five-year-old M1 laptop.
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://github.com/kevinzakka/mjbatch/blob/main/examples/cartpole_swingup.py"><img width="400" src="https://raw.githubusercontent.com/kevinzakka/mjbatch/main/examples/assets/cartpole_swingup.gif" alt="cart-pole swing-up"></a>
+      <a href="https://github.com/unilabsim/mjbatch_uni/blob/main/examples/cartpole_swingup.py"><img width="400" src="https://raw.githubusercontent.com/unilabsim/mjbatch_uni/main/examples/assets/cartpole_swingup.gif" alt="cart-pole swing-up"></a>
     </td>
     <td align="center" width="50%">
-      <a href="https://github.com/kevinzakka/mjbatch/blob/main/examples/cartpole_mpc.py"><img width="400" src="https://raw.githubusercontent.com/kevinzakka/mjbatch/main/examples/assets/cartpole_mpc.gif" alt="cart-pole MPC"></a>
+      <a href="https://github.com/unilabsim/mjbatch_uni/blob/main/examples/cartpole_mpc.py"><img width="400" src="https://raw.githubusercontent.com/unilabsim/mjbatch_uni/main/examples/assets/cartpole_mpc.gif" alt="cart-pole MPC"></a>
     </td>
   </tr>
   <tr>
@@ -97,10 +104,10 @@ RL controller learns to walk in under a minute on a five-year-old M1 laptop.
   </tr>
   <tr>
     <td align="center" width="50%">
-      <a href="https://github.com/kevinzakka/mjbatch/blob/main/examples/g1_flip.py"><img width="400" src="https://raw.githubusercontent.com/kevinzakka/mjbatch/main/examples/assets/g1_flip.gif" alt="G1 backflip"></a>
+      <a href="https://github.com/unilabsim/mjbatch_uni/blob/main/examples/g1_flip.py"><img width="400" src="https://raw.githubusercontent.com/unilabsim/mjbatch_uni/main/examples/assets/g1_flip.gif" alt="G1 backflip"></a>
     </td>
     <td align="center" width="50%">
-      <a href="https://github.com/kevinzakka/mjbatch/blob/main/examples/go1_joystick.py"><img width="400" src="https://raw.githubusercontent.com/kevinzakka/mjbatch/main/examples/assets/go1_joystick.gif" alt="Go1 joystick"></a>
+      <a href="https://github.com/unilabsim/mjbatch_uni/blob/main/examples/go1_joystick.py"><img width="400" src="https://raw.githubusercontent.com/unilabsim/mjbatch_uni/main/examples/assets/go1_joystick.gif" alt="Go1 joystick"></a>
     </td>
   </tr>
   <tr>
@@ -109,10 +116,10 @@ RL controller learns to walk in under a minute on a five-year-old M1 laptop.
   </tr>
   <tr>
     <td align="center" width="50%">
-      <a href="https://github.com/kevinzakka/mjbatch/blob/main/examples/arm_throw.py"><img width="400" src="https://raw.githubusercontent.com/kevinzakka/mjbatch/main/examples/assets/arm_throw.gif" alt="throwing arm co-design"></a>
+      <a href="https://github.com/unilabsim/mjbatch_uni/blob/main/examples/arm_throw.py"><img width="400" src="https://raw.githubusercontent.com/unilabsim/mjbatch_uni/main/examples/assets/arm_throw.gif" alt="throwing arm co-design"></a>
     </td>
     <td align="center" width="50%">
-      <a href="https://github.com/kevinzakka/mjbatch/blob/main/examples/rizon_inertia.py"><img width="400" src="https://raw.githubusercontent.com/kevinzakka/mjbatch/main/examples/assets/rizon_inertia.gif" alt="Rizon inertia identification"></a>
+      <a href="https://github.com/unilabsim/mjbatch_uni/blob/main/examples/rizon_inertia.py"><img width="400" src="https://raw.githubusercontent.com/unilabsim/mjbatch_uni/main/examples/assets/rizon_inertia.gif" alt="Rizon inertia identification"></a>
     </td>
   </tr>
   <tr>

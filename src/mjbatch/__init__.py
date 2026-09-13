@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -58,8 +59,9 @@ class Batch(_Batch):
     num_sims: int,
     num_threads: int = 0,
     forward: bool = False,
+    cpu_ids: Sequence[int] | None = None,
   ) -> None:
-    super().__init__(model, num_sims, num_threads, forward)
+    super().__init__(model, num_sims, num_threads, forward, cpu_ids)
     self.model = model
     self._active_model_update = False
     self.variant_pack: VariantPack | None = None
@@ -73,6 +75,7 @@ class Batch(_Batch):
     assignment: Any,
     num_threads: int = 0,
     forward: bool = False,
+    cpu_ids: Sequence[int] | None = None,
   ) -> "Batch":
     """Construct a batch from compiler-coherent, same-layout mesh variants."""
     ids = np.ascontiguousarray(assignment)
@@ -84,7 +87,13 @@ class Batch(_Batch):
     if checked.size and (checked.min() < 0 or checked.max() >= pack.num_variants):
       raise ValueError("assignment entries must be in variant range")
 
-    batch = cls(pack.model, num_sims, num_threads=num_threads, forward=forward)
+    batch = cls(
+      pack.model,
+      num_sims,
+      num_threads=num_threads,
+      forward=forward,
+      cpu_ids=cpu_ids,
+    )
     for name, values in pack.fields.items():
       batch.expand(name)[:] = values[ids]
     batch.set_const()
@@ -196,7 +205,7 @@ class Batch(_Batch):
     """World-frame position/rotation Jacobians of a site, per selected simulation.
 
     Returns (jacp, jacr) with shape (nsel, 3, nv). Runs kinematics and comPos
-    only, not mj_forward."""
+    only, not mj_forward, and does not refresh the bound views."""
     i = self.model.site(name).id
     n = self._nsel(ids)
     jacp = np.zeros((n, 3, self.model.nv))
@@ -205,15 +214,25 @@ class Batch(_Batch):
     return jacp, jacr
 
   def sample_hfield(  # pyright: ignore[reportIncompatibleMethodOverride]  # name-based allocating wrapper
-    self, geom: str, body: str, offsets: np.ndarray, ids: Any = None
+    self,
+    geom: str,
+    body: str,
+    offsets: np.ndarray,
+    ids: Any = None,
+    alignment: str = "world",
   ) -> np.ndarray:
-    """Bilinear hfield heights at world-frame XY offsets around a body's origin.
+    """Bilinear hfield sampling at XY offsets around a body's origin.
 
-    offsets: (npoint, 2). Returns (nsel, npoint) local heights. All simulations
-    sample the template's hfield. Runs kinematics only, not mj_forward."""
+    offsets: (npoint, 2), in the sampling grid's frame. alignment rotates the
+    grid: "world" keeps offsets in world axes, "yaw" rotates them by the frame
+    body's yaw about world z. Returns (nsel, npoint): the world z of the
+    sampled hfield surface (the local elevation for an unrotated geom at the
+    origin). All simulations sample the template's hfield; a per-sim
+    geom_pos/geom_quat moves the sampling frame. Runs kinematics only, not
+    mj_forward, and does not refresh the bound views."""
     g = self.model.geom(geom).id
     b = self.model.body(body).id
     offsets = np.ascontiguousarray(offsets, dtype=np.float64)
     out = np.zeros((self._nsel(ids), offsets.shape[0]))
-    super().sample_hfield(g, b, offsets, out, ids)
+    super().sample_hfield(g, b, offsets, out, ids, alignment)
     return out
