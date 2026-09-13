@@ -33,9 +33,9 @@ requires-python = ">=3.10"
 dependencies = ["mujoco==3.11.0", "numpy"]
 
 [project.urls]
-Homepage = "https://github.com/unilabsim/mjbatch_uni"
-Repository = "https://github.com/unilabsim/mjbatch_uni"
-Issues = "https://github.com/unilabsim/mjbatch_uni/issues"
+Homepage = "https://github.com/unilabsim/mjbatch-uni"
+Repository = "https://github.com/unilabsim/mjbatch-uni"
+Issues = "https://github.com/unilabsim/mjbatch-uni/issues"
 
 [dependency-groups]
 dev = ["pytest", "ruff", "pyright", "nanobind>=2.2.0"]
