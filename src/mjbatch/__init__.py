@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from functools import cached_property
+from typing import Any, Iterator, Mapping
 
 import mujoco
 import numpy as np
 
 from mjbatch._bindings import Batch as _Batch
+from mjbatch.groups import ModelAffineBatch as ModelAffineBatch
+from mjbatch.groups import TopologyGroup as TopologyGroup
+from mjbatch.model import ModelFieldSpec as ModelFieldSpec
+from mjbatch.model import RecomputeLevel as RecomputeLevel
+from mjbatch.model import build_model_fields
+from mjbatch.variants import VariantPack
 
 _QPOS_WIDTH = {0: 7, 1: 4, 2: 1, 3: 1}  # by mjtJoint: free, ball, slide, hinge
 _DOF_WIDTH = {0: 6, 1: 3, 2: 1, 3: 1}
@@ -55,6 +63,103 @@ class Batch(_Batch):
   ) -> None:
     super().__init__(model, num_sims, num_threads, forward, cpu_ids)
     self.model = model
+    self._active_model_update = False
+
+  @classmethod
+  def from_variant_pack(
+    cls,
+    pack: VariantPack,
+    num_sims: int,
+    assignment: Any,
+    num_threads: int = 0,
+    forward: bool = False,
+    cpu_ids: Sequence[int] | None = None,
+  ) -> "Batch":
+    """Construct a batch from compiler-coherent, same-layout mesh variants."""
+    ids = np.ascontiguousarray(assignment)
+    if ids.ndim != 1 or ids.shape[0] != num_sims:
+      raise ValueError("assignment must have one entry per simulation")
+    if ids.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+      raise ValueError("assignment must contain int32 or int64 variant ids")
+    checked = ids.astype(np.int64, copy=False)
+    if checked.size and (checked.min() < 0 or checked.max() >= pack.num_variants):
+      raise ValueError("assignment entries must be in variant range")
+
+    batch = cls(
+      pack.model,
+      num_sims,
+      num_threads=num_threads,
+      forward=forward,
+      cpu_ids=cpu_ids,
+    )
+    for name, values in pack.fields.items():
+      batch.expand(name)[:] = values[ids]
+    batch.set_const()
+    return batch
+
+  @cached_property
+  def _model_fields(self) -> Mapping[str, ModelFieldSpec]:
+    return build_model_fields(self.model)
+
+  def _normalize_ids(self, ids: Any) -> np.ndarray | None:
+    if ids is None:
+      return None
+    array = np.ascontiguousarray(ids)
+    if array.ndim != 1:
+      raise ValueError("ids must be one-dimensional")
+    if array.dtype == bool:
+      if array.shape[0] != self.num_sims:
+        raise ValueError("a boolean ids mask must have num_sims entries")
+      return array
+    if array.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+      raise ValueError("ids must be int32, int64 or a bool mask")
+    checked = array.astype(np.int64, copy=False)
+    if (checked.size and (checked[0] < 0 or checked[-1] >= self.num_sims)) or np.any(np.diff(checked) <= 0):
+      raise ValueError("ids must be sorted, unique and in range")
+    return array
+
+  def model_field_specs(self) -> Mapping[str, ModelFieldSpec]:
+    """Return immutable metadata for every model field exposed by ``expand``."""
+    return self._model_fields
+
+  def expand(self, name: str, dtype: Any = None) -> np.ndarray:
+    spec = self._model_fields.get(name)
+    if spec is not None and not spec.writable:
+      reason = "asset data" if spec.asset else "read-only structural data"
+      raise ValueError(f"{name} is {reason}")
+    return super().expand(name, dtype)
+
+  @contextmanager
+  def model_update(self, *fields: str, ids: Any = None) -> Iterator[None]:
+    """Declare model-field writes, then perform one recompute on exit.
+
+    This mirrors mjlab event terms: callers declare fields, and mjbatch computes the
+    strongest recompute level from ``model_field_specs()``. A level above ``NONE``
+    currently uses one conservative full stock-MuJoCo ``mj_setConst`` pass.
+    """
+    ids_array = self._normalize_ids(ids)
+    specs = self._model_fields
+    unknown = [field for field in fields if field not in specs]
+    if unknown:
+      raise ValueError(f"unknown model fields: {unknown}")
+    unwritable = [field for field in fields if not specs[field].writable]
+    if unwritable:
+      raise ValueError(f"model fields are not writable: {unwritable}")
+    if self._active_model_update:
+      raise RuntimeError("model_update calls cannot be nested")
+    self._active_model_update = True
+    try:
+      yield
+    finally:
+      self._active_model_update = False
+      level = max((specs[field].recompute for field in fields), default=RecomputeLevel.NONE)
+      if level != RecomputeLevel.NONE:
+        super().set_const(ids_array)
+
+  def set_const(self, ids: Any = None) -> None:
+    if self._active_model_update:
+      raise RuntimeError("call set_const after model_update exits, not inside it")
+    super().set_const(ids)
 
   def sensor(self, name: str, dtype: Any = None) -> np.ndarray:
     s = self.model.sensor(name)

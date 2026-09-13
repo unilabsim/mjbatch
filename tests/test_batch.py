@@ -5,12 +5,15 @@ import os
 import subprocess
 import sys
 import threading
+from typing import cast
 
 import mujoco
 import numpy as np
 import pytest
 
-from mjbatch import Batch
+from mjbatch import Batch, ModelAffineBatch, ModelFieldSpec, RecomputeLevel
+from mjbatch._bindings import Batch as RawBatch
+from mjbatch.variants import VariantPack
 
 XML = """
 <mujoco>
@@ -45,6 +48,15 @@ XML = """
 </mujoco>
 """
 N = 8
+TETRAHEDRON_OBJ = """v 0 0 0
+v 1 0 0
+v 0 1 0
+v 0 0 1
+f 1 3 2
+f 1 2 4
+f 1 4 3
+f 2 3 4
+"""
 
 # Activation dynamics, a mocap weld, a keyframe, and sensors that set mjData's
 # lazy-evaluation flags (accelerometer, subtreelinvel).
@@ -166,6 +178,283 @@ def test_lockstep_with_mj_step(nstep, num_threads):
 @pytest.mark.parametrize("nstep", [1, 3])
 def test_lockstep_with_expanded_mass(nstep):
   lockstep(nstep, num_threads=4, heavy=(1, 2, 5))
+
+
+@pytest.mark.parametrize("num_threads", [1, 3])
+def test_mesh_pool_geom_dataid_matches_reference_models(tmp_path, num_threads):
+  """A canonical model can pool meshes and select one per simulation.
+
+  The compiler-derived fields are scattered from independently compiled reference
+  models, then set_const recomputes the constants that depend on them. This is the
+  stock-CPU foundation for future variant-pack construction: assets stay shared,
+  while geom_dataid and non-asset model fields become per-simulation rows.
+  """
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def compile_model(assets: str) -> mujoco.MjModel:
+    xml = f"""
+<mujoco>
+  <option timestep="0.002"/>
+  <asset>{assets}</asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 .1"/>
+    <body name="body" pos=".01 .02 .8">
+      <freejoint/>
+      <geom name="mesh" type="mesh" mesh="mesh0" mass="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    return mujoco.MjModel.from_xml_string(xml)
+
+  canonical = compile_model(
+    f'<mesh name="mesh0" file="{obj_path}"/><mesh name="mesh1" file="{obj_path}" scale=".7 .8 1.2"/>'
+  )
+  references = [
+    compile_model(f'<mesh name="mesh0" file="{obj_path}"/>'),
+    compile_model(f'<mesh name="mesh0" file="{obj_path}" scale=".7 .8 1.2"/>'),
+  ]
+
+  batch = Batch(canonical, N, num_threads=num_threads)
+  variant_ids = np.array([1, 3, 4, 7])
+  mesh_geom = canonical.geom("mesh").id
+  variant_fields = (
+    "geom_size",
+    "geom_rbound",
+    "geom_aabb",
+    "geom_pos",
+    "geom_quat",
+    "body_mass",
+    "body_subtreemass",
+    "body_inertia",
+    "body_invweight0",
+    "body_ipos",
+    "body_iquat",
+  )
+  for field in variant_fields:
+    batch.expand(field)[variant_ids] = getattr(references[1], field)
+
+  geom_dataid = batch.expand("geom_dataid")
+  geom_dataid[variant_ids, mesh_geom] = 1
+  batch.set_const(variant_ids)
+
+  expected_variants = np.zeros(N, dtype=np.int32)
+  expected_variants[variant_ids] = 1
+  np.testing.assert_array_equal(geom_dataid[:, mesh_geom], expected_variants)
+  for field in (*variant_fields, "dof_M0", "dof_invweight0", "dof_length"):
+    expected = [getattr(references[v], field) for v in expected_variants]
+    np.testing.assert_array_equal(batch.expand(field), expected, field)
+
+  state = batch.bind("state")
+  batch.step(nstep=25)
+  for i, reference in enumerate(references):
+    data = mujoco.MjData(reference)
+    for _ in range(25):
+      mujoco.mj_step(reference, data)
+    expected_state = np.empty(batch.nstate)
+    mujoco.mj_getState(reference, data, expected_state, mujoco.mjtState.mjSTATE_INTEGRATION)
+    rows = np.flatnonzero(expected_variants == i)
+    np.testing.assert_array_equal(state[rows], np.tile(expected_state, (len(rows), 1)))
+
+
+def test_variant_pack_matches_independently_compiled_references(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def make_spec(scale_a: str, scale_b: str, *, include_b: bool = True):
+    meshes = f'<mesh name="a" file="{obj_path}" scale="{scale_a}"/>'
+    if include_b:
+      meshes += f'<mesh name="b" file="{obj_path}" scale="{scale_b}"/>'
+    geoms = '<geom name="a" type="mesh" mesh="a" mass="1"/>'
+    if include_b:
+      geoms += '<geom name="b" type="mesh" mesh="b" mass="1"/>'
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <option timestep="0.002"/>
+  <asset>{meshes}</asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="10 10 .1"/>
+    <body name="body" pos=".01 .02 .8">
+      <freejoint name="free"/>
+      {geoms}
+    </body>
+  </worldbody>
+</mujoco>
+"""
+    )
+
+  specs = [
+    make_spec("1 1 1", "1 1 1"),
+    make_spec(".7 .8 1.2", ".9 .9 .9"),
+    make_spec(".5 .6 .7", "1 1 1", include_b=False),
+  ]
+  pack = VariantPack.from_specs(specs)
+  assert pack.num_variants == 3
+  assert pack.model.nmesh == 5
+  assert pack.model.ngeom == 3
+  dataids = pack.fields["geom_dataid"]
+  missing = pack.model.geom("b").id
+  assert np.take(dataids, [1, 2, 4, 5, 7]).min() >= 0
+  assert dataids[0, 0] == -1
+  assert dataids[2, missing] == -1
+  assert pack.fields["geom_type"][2, missing] == mujoco.mjtGeom.mjGEOM_NONE
+  assert pack.fields["geom_contype"][2, missing] == 0
+  assert pack.fields["geom_conaffinity"][2, missing] == 0
+  assert pack.fields["geom_size"][2, missing].shape == (3,)
+  np.testing.assert_array_equal(pack.fields["geom_size"][2, missing], 0.0)
+
+  assignment = np.arange(N) % 3
+  batch = Batch.from_variant_pack(pack, N, assignment, num_threads=3)
+  state = batch.bind("state")
+  batch.step(nstep=25)
+  for variant, spec in enumerate(specs):
+    reference = spec.compile()
+    data = mujoco.MjData(reference)
+    for _ in range(25):
+      mujoco.mj_step(reference, data)
+    expected = np.empty(batch.nstate)
+    mujoco.mj_getState(reference, data, expected, mujoco.mjtState.mjSTATE_INTEGRATION)
+    rows = np.flatnonzero(assignment == variant)
+    np.testing.assert_array_equal(state[rows], np.tile(expected, (len(rows), 1)))
+
+
+def test_variant_pack_deduplicates_identical_meshes(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+  spec = mujoco.MjSpec.from_string(
+    f"""
+<mujoco>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody><body><freejoint name="free"/><geom name="mesh" type="mesh" mesh="mesh"/></body></worldbody>
+</mujoco>
+"""
+  )
+  pack = VariantPack.from_specs([spec, spec])
+  assert pack.num_variants == 2
+  assert pack.model.nmesh == 1
+  np.testing.assert_array_equal(pack.fields["geom_dataid"], np.zeros((2, 1), dtype=np.int32))
+  with pytest.raises(ValueError, match="read-only"):
+    pack.fields["geom_dataid"][0, 0] = -1
+  if sys.platform == "linux":
+    cpus = sorted(os.sched_getaffinity(0))[:1]  # pyright: ignore[reportAttributeAccessIssue]
+    pinned = Batch.from_variant_pack(pack, 2, np.array([0, 1]), cpu_ids=cpus)
+    assert pinned.num_threads == 1
+
+
+def test_variant_pack_validates_slots_layout_and_assignment(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+  spec = mujoco.MjSpec.from_string(
+    f"""
+<mujoco>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody>
+    <body><freejoint name="free"/><geom name="mesh" type="mesh" mesh="mesh"/></body>
+  </worldbody>
+</mujoco>
+"""
+  )
+  changed_layout = mujoco.MjSpec.from_string(
+    f"""
+<mujoco>
+      <asset><mesh name="mesh" file="{obj_path}"/></asset>
+      <worldbody>
+        <site name="extra"/>
+        <body>
+          <freejoint name="free"/>
+          <geom name="mesh" type="mesh" mesh="mesh"/>
+        </body>
+      </worldbody>
+</mujoco>
+"""
+  )
+  with pytest.raises(ValueError, match="changes layout field"):
+    VariantPack.from_specs([spec, changed_layout])
+
+  pack = VariantPack.from_specs([spec, spec])
+  with pytest.raises(ValueError, match="assignment entries"):
+    Batch.from_variant_pack(pack, N, np.full(N, 2))
+
+
+def test_variant_pack_rejects_shared_parameter_changes(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def make_spec(ctrlrange: str):
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody>
+    <body><freejoint name="free"/><geom name="mesh" type="mesh" mesh="mesh"/></body>
+  </worldbody>
+  <actuator><motor joint="free" ctrlrange="{ctrlrange}"/></actuator>
+</mujoco>
+"""
+    )
+
+  with pytest.raises(ValueError, match="changes shared field actuator_ctrlrange"):
+    VariantPack.from_specs([make_spec("-1 1"), make_spec("-2 2")])
+
+
+def test_model_affine_batch_routes_global_ids(model):
+  other = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  group_batch, other_batch = Batch(model, N // 2), Batch(other, N // 2)
+  control_batch, other_control = Batch(model, N // 2), Batch(other, N // 2)
+  sharded = ModelAffineBatch(
+    [group_batch, other_batch],
+    names=["cart", "lockstep"],
+  )
+  assert sharded.num_sims == N
+  assert len(sharded.groups) == 2
+  np.testing.assert_array_equal(sharded["cart"].global_ids, np.arange(N // 2))
+  np.testing.assert_array_equal(sharded["lockstep"].global_ids, np.arange(N // 2, N))
+  assert sharded["cart"].nstate != sharded["lockstep"].nstate
+
+  ids = np.array([0, 2, 5, 7])
+  sharded.step(ids)
+  control_batch.step(np.array([0, 2]))
+  other_control.step(np.array([1, 3]))
+  np.testing.assert_array_equal(sharded["cart"].state, control_batch.bind("state"))
+  np.testing.assert_array_equal(sharded["lockstep"].state, other_control.bind("state"))
+
+  sharded.reset(ids, keyframe=0)
+  control_batch.reset(np.array([0, 2]), keyframe=0)
+  other_control.reset(np.array([1, 3]), keyframe=0)
+  np.testing.assert_array_equal(sharded["cart"].state, control_batch.bind("state"))
+  np.testing.assert_array_equal(sharded["lockstep"].state, other_control.bind("state"))
+
+  with pytest.raises(ValueError, match="collect state from each group"):
+    sharded.step(history=np.empty((0, 1, 1)))
+
+
+def test_model_affine_batch_model_update_and_validation(model):
+  other = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
+  batches = [Batch(model, N // 2), Batch(other, N // 2)]
+  sharded = ModelAffineBatch(batches)
+  ids = np.array([0, 2, 5, 7])
+  with sharded.model_update("body_mass", ids=ids):
+    for group in sharded.groups:
+      local_ids = np.searchsorted(group.global_ids, ids[np.isin(ids, group.global_ids)])
+      group.expand("body_mass")[local_ids, 1] = 2.0
+
+  for group in sharded.groups:
+    subtree = group.expand("body_subtreemass")
+    local_ids = np.searchsorted(group.global_ids, ids[np.isin(ids, group.global_ids)])
+    np.testing.assert_array_equal(subtree[local_ids, 1], 2.1)
+    unselected = np.setdiff1d(np.arange(group.num_sims), local_ids)
+    np.testing.assert_array_equal(subtree[unselected, 1], group.batch.model.body_subtreemass[1])
+
+  with pytest.raises(ValueError, match="cover every global id"):
+    ModelAffineBatch(batches, [np.arange(N // 2), np.arange(N // 2)])
+  with pytest.raises(ValueError, match="names must be unique"):
+    ModelAffineBatch(batches, names=["same", "same"])
+  with pytest.raises(ValueError, match="ids must be sorted"):
+    sharded.step(np.array([2, 0]))
+  with pytest.raises(ValueError, match="keyframe out of range"):
+    sharded.reset(keyframe=99)
 
 
 @pytest.mark.parametrize("nstep", [1, 3])
@@ -340,6 +629,79 @@ def test_expanded_option_seeds_from_the_template(model):
   np.testing.assert_array_equal(batch.bind("state"), ref.bind("state"))
 
 
+def test_model_field_specs_describe_the_contract(model):
+  specs = Batch(model, N).model_field_specs()
+
+  assert specs["body_mass"].shape == (model.nbody,)
+  assert specs["body_mass"].dtype == np.dtype(np.float64)
+  assert specs["body_mass"].writable
+  assert not specs["body_mass"].asset
+  assert specs["body_mass"].recompute == RecomputeLevel.SET_CONST
+  assert specs["body_mass"].recompute == RecomputeLevel.SET_CONST
+
+  assert specs["body_gravcomp"].recompute == RecomputeLevel.SET_CONST
+  assert specs["qpos0"].recompute == RecomputeLevel.SET_CONST
+  assert specs["geom_friction"].recompute == RecomputeLevel.NONE
+  assert specs["timestep"].shape == ()
+  assert specs["timestep"].dtype == np.dtype(np.float64)
+  assert specs["integrator"].dtype == np.dtype(np.int32)
+  assert specs["gravity"].shape == (3,)
+
+  assert specs["mesh_vert"].asset
+  assert not specs["mesh_vert"].writable
+  assert not specs["body_parentid"].writable
+  with pytest.raises(TypeError):
+    cast(dict[str, ModelFieldSpec], specs)["new_field"] = specs["body_mass"]
+
+
+def test_model_update_recomputes_selected_rows_once(model, monkeypatch):
+  batch = Batch(model, N, num_threads=2)
+  pole = model.body("pole").id
+  ids = np.array([1, 4])
+  calls: list[np.ndarray | None] = []
+  raw_set_const = RawBatch.set_const
+
+  def counting_set_const(raw_batch: RawBatch, ids: np.ndarray | None = None) -> None:
+    calls.append(None if ids is None else ids.copy())
+    raw_set_const(raw_batch, ids)
+
+  monkeypatch.setattr(RawBatch, "set_const", counting_set_const)
+  with batch.model_update("body_mass", "geom_friction", ids=ids):
+    batch.expand("body_mass")[ids, pole] = 2.0
+    batch.expand("geom_friction")[ids, :, 0] = 0.7
+  assert len(calls) == 1
+  np.testing.assert_array_equal(calls[0], ids)
+
+  subtree = batch.expand("body_subtreemass")
+  np.testing.assert_array_equal(subtree[ids, pole], 2.0)
+  np.testing.assert_array_equal(
+    subtree[np.setdiff1d(np.arange(N), ids), pole],
+    model.body_subtreemass[pole],
+  )
+  expected_mass = batch.expand("body_mass").copy()
+
+  with batch.model_update("geom_friction", ids=ids):
+    batch.expand("geom_friction")[ids, :, 1] = 0.8
+  assert len(calls) == 1
+  np.testing.assert_array_equal(batch.expand("body_mass"), expected_mass)
+
+
+def test_model_update_is_transactional_and_fail_closed(model):
+  batch = Batch(model, N)
+  with pytest.raises(ValueError, match="read-only structural data"):
+    batch.expand("body_parentid")
+  with pytest.raises(ValueError, match="not writable"):
+    with batch.model_update("body_parentid"):
+      pass
+  with pytest.raises(RuntimeError, match="cannot be nested"):
+    with batch.model_update("body_mass"):
+      with batch.model_update("body_mass"):
+        pass
+  with pytest.raises(RuntimeError, match="after model_update exits"):
+    with batch.model_update("body_mass"):
+      batch.set_const()
+
+
 def test_option_is_untouched_by_set_const(model):
   # mj_setConst never writes opt, so no opt field can be flagged as one of its
   # outputs and expanded behind the caller's back.
@@ -416,6 +778,7 @@ def test_step_history_accepts_degenerate_strides(model):
   # numpy gives a size-0 array all-zero strides and a new axis a zero stride.
   batch = Batch(model, N)
   batch.step(np.zeros(N, dtype=bool), nstep=3, history=np.empty((0, 3, batch.nstate)))
+  batch.step(np.array([], dtype=np.int64), nstep=2, history=np.empty((0, 2, batch.nstate)))
   history = np.empty((4, batch.nstate))
   batch.step(np.array([2]), nstep=4, history=history[None])
   np.testing.assert_array_equal(history[-1], batch.bind("state")[2])
