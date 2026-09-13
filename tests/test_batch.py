@@ -307,7 +307,6 @@ def test_variant_pack_matches_independently_compiled_references(tmp_path):
 
   assignment = np.arange(N) % 3
   batch = Batch.from_variant_pack(pack, N, assignment, num_threads=3)
-  np.testing.assert_array_equal(batch.variant_assignment, assignment)
   state = batch.bind("state")
   batch.step(nstep=25)
   for variant, spec in enumerate(specs):
@@ -379,6 +378,27 @@ def test_variant_pack_validates_slots_layout_and_assignment(tmp_path):
     Batch.from_variant_pack(pack, N, np.full(N, 2))
 
 
+def test_variant_pack_rejects_shared_parameter_changes(tmp_path):
+  obj_path = tmp_path / "tetrahedron.obj"
+  obj_path.write_text(TETRAHEDRON_OBJ)
+
+  def make_spec(ctrlrange: str):
+    return mujoco.MjSpec.from_string(
+      f"""
+<mujoco>
+  <asset><mesh name="mesh" file="{obj_path}"/></asset>
+  <worldbody>
+    <body><freejoint name="free"/><geom name="mesh" type="mesh" mesh="mesh"/></body>
+  </worldbody>
+  <actuator><motor joint="free" ctrlrange="{ctrlrange}"/></actuator>
+</mujoco>
+"""
+    )
+
+  with pytest.raises(ValueError, match="changes shared field actuator_ctrlrange"):
+    VariantPack.from_specs([make_spec("-1 1"), make_spec("-2 2")])
+
+
 def test_model_affine_batch_routes_global_ids(model):
   other = mujoco.MjModel.from_xml_string(LOCKSTEP_XML)
   group_batch, other_batch = Batch(model, N // 2), Batch(other, N // 2)
@@ -388,9 +408,9 @@ def test_model_affine_batch_routes_global_ids(model):
     names=["cart", "lockstep"],
   )
   assert sharded.num_sims == N
-  assert sharded.num_groups == 2
+  assert len(sharded.groups) == 2
   np.testing.assert_array_equal(sharded["cart"].global_ids, np.arange(N // 2))
-  np.testing.assert_array_equal(sharded.group("lockstep").global_ids, np.arange(N // 2, N))
+  np.testing.assert_array_equal(sharded["lockstep"].global_ids, np.arange(N // 2, N))
   assert sharded["cart"].nstate != sharded["lockstep"].nstate
 
   ids = np.array([0, 2, 5, 7])
@@ -617,17 +637,10 @@ def test_model_field_specs_describe_the_contract(model):
   assert specs["body_mass"].writable
   assert not specs["body_mass"].asset
   assert specs["body_mass"].recompute == RecomputeLevel.SET_CONST
-  assert specs["body_mass"].derived_fields == (
-    "body_subtreemass",
-    "dof_invweight0",
-    "body_invweight0",
-    "tendon_length0",
-    "tendon_invweight0",
-    "actuator_acc0",
-  )
+  assert specs["body_mass"].recompute == RecomputeLevel.SET_CONST
 
-  assert specs["body_gravcomp"].recompute == RecomputeLevel.SET_CONST_FIXED
-  assert specs["qpos0"].recompute == RecomputeLevel.SET_CONST_0
+  assert specs["body_gravcomp"].recompute == RecomputeLevel.SET_CONST
+  assert specs["qpos0"].recompute == RecomputeLevel.SET_CONST
   assert specs["geom_friction"].recompute == RecomputeLevel.NONE
   assert specs["timestep"].shape == ()
   assert specs["timestep"].dtype == np.dtype(np.float64)

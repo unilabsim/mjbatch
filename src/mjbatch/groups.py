@@ -92,25 +92,18 @@ class ModelAffineBatch:
     return self._groups
 
   @property
-  def num_groups(self) -> int:
-    return len(self._groups)
-
-  @property
   def num_sims(self) -> int:
     return sum(group.num_sims for group in self._groups)
 
-  def group(self, key: str | int) -> TopologyGroup:
+  def __getitem__(self, key: str | int) -> TopologyGroup:
     if isinstance(key, str):
       try:
         return self._by_name[key]
       except KeyError as error:
         raise KeyError(f"unknown topology group {key!r}") from error
-    if key < 0 or key >= self.num_groups:
+    if key < 0 or key >= len(self._groups):
       raise IndexError("topology group index out of range")
     return self._groups[key]
-
-  def __getitem__(self, key: str | int) -> TopologyGroup:
-    return self.group(key)
 
   def _normalize_ids(self, ids: Any) -> np.ndarray | None:
     if ids is None:
@@ -132,7 +125,7 @@ class ModelAffineBatch:
   def _split_ids(self, ids: Any) -> list[np.ndarray | None]:
     global_ids = self._normalize_ids(ids)
     if global_ids is None:
-      return [None] * self.num_groups
+      return [None] * len(self._groups)
     result: list[np.ndarray | None] = []
     for group in self._groups:
       positions = np.searchsorted(group.global_ids, global_ids)

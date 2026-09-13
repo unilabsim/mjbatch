@@ -64,8 +64,6 @@ class Batch(_Batch):
     super().__init__(model, num_sims, num_threads, forward, cpu_ids)
     self.model = model
     self._active_model_update = False
-    self.variant_pack: VariantPack | None = None
-    self.variant_assignment: np.ndarray | None = None
 
   @classmethod
   def from_variant_pack(
@@ -97,8 +95,6 @@ class Batch(_Batch):
     for name, values in pack.fields.items():
       batch.expand(name)[:] = values[ids]
     batch.set_const()
-    batch.variant_pack = pack
-    batch.variant_assignment = ids.copy()
     return batch
 
   @cached_property

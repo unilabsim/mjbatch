@@ -10,40 +10,19 @@ import numpy as np
 
 
 class RecomputeLevel(IntEnum):
-  """Derived model constants refreshed after a model-field write."""
+  """Whether a model-field write requires a stock-MuJoCo ``set_const`` pass."""
 
   NONE = 0
-  SET_CONST_FIXED = 1
-  SET_CONST_0 = 2
-  SET_CONST = 3
+  SET_CONST = 1
 
-  @property
-  def derived_fields(self) -> tuple[str, ...]:
-    return _DERIVED_FIELDS[self]
-
-
-_DERIVED_FIELDS = {
-  RecomputeLevel.NONE: (),
-  RecomputeLevel.SET_CONST_FIXED: ("body_subtreemass",),
-  RecomputeLevel.SET_CONST_0: (
-    "dof_invweight0",
-    "body_invweight0",
-    "tendon_length0",
-    "tendon_invweight0",
-    "actuator_acc0",
-  ),
-}
-_DERIVED_FIELDS[RecomputeLevel.SET_CONST] = (
-  _DERIVED_FIELDS[RecomputeLevel.SET_CONST_FIXED] + _DERIVED_FIELDS[RecomputeLevel.SET_CONST_0]
-)
 
 _RECOMPUTE_BY_FIELD = {
-  "body_gravcomp": RecomputeLevel.SET_CONST_FIXED,
-  "body_pos": RecomputeLevel.SET_CONST_0,
-  "body_quat": RecomputeLevel.SET_CONST_0,
-  "qpos0": RecomputeLevel.SET_CONST_0,
-  "dof_armature": RecomputeLevel.SET_CONST_0,
-  "tendon_armature": RecomputeLevel.SET_CONST_0,
+  "body_gravcomp": RecomputeLevel.SET_CONST,
+  "body_pos": RecomputeLevel.SET_CONST,
+  "body_quat": RecomputeLevel.SET_CONST,
+  "qpos0": RecomputeLevel.SET_CONST,
+  "dof_armature": RecomputeLevel.SET_CONST,
+  "tendon_armature": RecomputeLevel.SET_CONST,
   "body_mass": RecomputeLevel.SET_CONST,
   "body_ipos": RecomputeLevel.SET_CONST,
   "body_inertia": RecomputeLevel.SET_CONST,
@@ -65,10 +44,6 @@ class ModelFieldSpec:
   writable: bool
   asset: bool
   recompute: RecomputeLevel
-
-  @property
-  def derived_fields(self) -> tuple[str, ...]:
-    return self.recompute.derived_fields
 
 
 def _is_writable(name: str, dtype: np.dtype[Any]) -> bool:

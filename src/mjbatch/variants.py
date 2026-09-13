@@ -31,6 +31,29 @@ _BODY_VARIANT_FIELDS = (
 _DOF_VARIANT_FIELDS = ("dof_M0", "dof_invweight0", "dof_length")
 _DIRECT_VARIANT_FIELDS = _BODY_VARIANT_FIELDS + _DOF_VARIANT_FIELDS
 _VARIANT_FIELDS = _GEOM_VARIANT_FIELDS + _DIRECT_VARIANT_FIELDS
+_ALLOWED_GEOM_FIELDS = frozenset(_GEOM_VARIANT_FIELDS) | {"geom_dataid"}
+_ALLOWED_BODY_FIELDS = frozenset(_BODY_VARIANT_FIELDS)
+_ALLOWED_DOF_FIELDS = frozenset(_DOF_VARIANT_FIELDS)
+_ALLOWED_DERIVED_FIELDS = frozenset({"tendon_length0", "tendon_invweight0", "actuator_acc0"})
+_SHARED_PARAMETER_PREFIXES = (
+  "body_",
+  "geom_",
+  "jnt_",
+  "dof_",
+  "actuator_",
+  "sensor_",
+  "site_",
+  "pair_",
+  "eq_",
+  "wrap_",
+  "light_",
+  "cam_",
+  "tendon_",
+  "qpos0",
+  "qpos_spring",
+)
+_IGNORED_COMPILER_FLAGS = frozenset({"body_sameframe", "geom_sameframe"})
+_IGNORED_COMPILER_METADATA_PREFIXES = ("body_geom", "body_bvh", "geom_bvh")
 
 _LAYOUT_SCALARS = (
   "nq",
@@ -122,6 +145,8 @@ class VariantPack:
     canonical = canonical_spec.compile()
     _validate_layout(reference_models, canonical)
     geom_maps = _validate_names_and_build_geom_maps(reference_models, canonical)
+    _validate_shared_parameters(reference_models, canonical, geom_maps)
+    _validate_shared_options(reference_models, canonical)
     mesh_id_maps = _build_mesh_id_maps(
       reference_models,
       canonical,
@@ -291,6 +316,57 @@ def _validate_names_and_build_geom_maps(
       raise ValueError(f"variant {variant} has geoms absent from the canonical layout: {sorted(unknown)}")
     maps.append(np.asarray([canonical_geom_ids[name] for name in names], dtype=np.int32))
   return maps
+
+
+def _validate_shared_parameters(
+  references: Sequence[mujoco.MjModel],
+  canonical: mujoco.MjModel,
+  geom_maps: Sequence[np.ndarray],
+) -> None:
+  """Reject shared parameter changes that a canonical executor cannot represent."""
+
+  for variant, (reference, geom_map) in enumerate(zip(references, geom_maps, strict=True)):
+    for name in dir(canonical):
+      if not name.startswith(_SHARED_PARAMETER_PREFIXES):
+        continue
+      if (
+        name in _IGNORED_COMPILER_FLAGS
+        or name.startswith(_IGNORED_COMPILER_METADATA_PREFIXES)
+        or name in _ALLOWED_BODY_FIELDS
+        or name in _ALLOWED_DOF_FIELDS
+        or name in _ALLOWED_GEOM_FIELDS
+        or name in _ALLOWED_DERIVED_FIELDS
+      ):
+        continue
+      expected = getattr(canonical, name, None)
+      actual = getattr(reference, name, None)
+      if not isinstance(expected, np.ndarray) or not isinstance(actual, np.ndarray):
+        continue
+      if expected.shape != actual.shape:
+        continue
+      canonical_values = expected[geom_map] if name.startswith("geom_") else expected
+      if not np.array_equal(canonical_values, actual):
+        raise ValueError(f"variant {variant} changes shared field {name}")
+
+
+def _validate_shared_options(
+  references: Sequence[mujoco.MjModel],
+  canonical: mujoco.MjModel,
+) -> None:
+  for variant, reference in enumerate(references):
+    for name in dir(canonical.opt):
+      if name.startswith("_") or name == "timestep":
+        continue
+      expected = getattr(canonical.opt, name, None)
+      actual = getattr(reference.opt, name, None)
+      if isinstance(expected, np.ndarray) and isinstance(actual, np.ndarray):
+        same = np.array_equal(expected, actual)
+      elif isinstance(expected, (bool, int, float)) and isinstance(actual, (bool, int, float)):
+        same = expected == actual
+      else:
+        continue
+      if not same:
+        raise ValueError(f"variant {variant} changes option {name}")
 
 
 def _build_mesh_id_maps(
