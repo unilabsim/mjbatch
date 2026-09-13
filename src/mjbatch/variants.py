@@ -353,9 +353,7 @@ def _validate_shared_options(
   references: Sequence[mujoco.MjModel],
   canonical: mujoco.MjModel,
 ) -> None:
-  option_names = tuple(
-    name for name in dir(canonical.opt) if not name.startswith("_") and name != "timestep"
-  )
+  option_names = tuple(name for name in dir(canonical.opt) if not name.startswith("_") and name != "timestep")
   for variant, reference in enumerate(references):
     for name in option_names:
       expected = getattr(canonical.opt, name, None)
