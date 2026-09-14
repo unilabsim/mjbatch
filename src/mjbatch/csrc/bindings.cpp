@@ -77,6 +77,7 @@ handler installed at import; installing another handler later disables it.)")
       .def("expand", &Batch::expand, "name"_a, "dtype"_a = nb::none())
       .def("step", &Batch::step, "ids"_a.noconvert() = nb::none(), "nstep"_a = 1,
            "history"_a.noconvert() = nb::none(), nb::kw_only(), "callback"_a = nb::none(),
+           "substep_sensor_copyout"_a = nb::none(),
            "nstep mj_step calls per simulation, on one worker. ids: sorted unique ints or a "
            "bool mask. history: an optional caller-allocated (sims, nstep, nstate) array "
            "filled with each selected simulation's state after every substep, in "
@@ -88,7 +89,15 @@ handler installed at import; installing another handler later disables it.)")
            "the next substep, like a state write between calls. Substeps are dispatched "
            "one at a time, so bound fields other than state stay stale until the call "
            "ends. Batch calls from inside the callback raise; an exception stops the "
-           "simulations at the last completed substep, recoverably.")
+           "simulations at the last completed substep, recoverably.\n"
+           "substep_sensor_copyout=(start, stop) opts into an Euler-only mj_step1/mj_step2 "
+           "split. Before each callback, mj_step1 runs and the half-open sensordata column "
+           "range is copied into a fourth live callback argument, sensor. Position- and "
+           "velocity-stage sensors in that range are current with state; acceleration-stage "
+           "values (including contact forces) are not available at this split point and may "
+           "be stale. Writes to ctrl and bound input fields occur between step1 and step2, "
+           "so they affect the current substep. If the callback raises, state remains at "
+           "the last completed substep; intermediate mjData is recovered on the next call.")
       .def("forward", &Batch::forward, "ids"_a.noconvert() = nb::none())
       .def("reset", &Batch::reset, "ids"_a.noconvert() = nb::none(), "keyframe"_a = -1,
            "mj_resetData, or mj_resetDataKeyframe when keyframe >= 0, then mj_forward.")
