@@ -328,6 +328,9 @@ struct CallbackCtx {
   mjtNum* hist = nullptr;   // (sel, nstep, nstate) row for this sim
   uint8_t* done = nullptr;  // set when this selection row runs its copy-out tail
   bool tail_only = false;   // exception cleanup: no mj_step, copy out where it stopped
+  Slot* sensor = nullptr;   // Substep1: bound sensordata slot receiving selected columns
+  int sensor_start = 0;
+  int sensor_width = 0;
 };
 
 // Bilinear sampling of one hfield geom at XY offsets from a frame body's origin.
@@ -406,7 +409,17 @@ inline thread_local const Batch* tls_callback = nullptr;
 
 class Batch {
  public:
-  enum class Op { Step, Substep, Forward, Reset, SetConst, JacSite, SampleHfield };
+  enum class Op {
+    Step,
+    Substep,   // callback-step recovery tail
+    Substep1,  // split callback: mj_step1 and selected sensor copy-out
+    Substep2,  // split callback: apply writes and mj_step2
+    Forward,
+    Reset,
+    SetConst,
+    JacSite,
+    SampleHfield
+  };
   using Ids = nb::ndarray<nb::ndim<1>, nb::c_contig>;
 
   Batch(nb::object model, int num_sims, int num_threads, bool forward,
@@ -474,16 +487,32 @@ class Batch {
   }
 
   void step(std::optional<Ids> ids, int nstep, std::optional<nb::ndarray<>> history,
-            std::optional<nb::callable> callback) {
+            std::optional<nb::callable> callback,
+            std::optional<std::vector<int>> substep_sensor_copyout) {
     ReentryGuard();
     if (nstep < 1) throw nb::value_error("nstep must be >= 1");
+    int sensor_start = 0, sensor_stop = 0;
+    if (substep_sensor_copyout) {
+      if (substep_sensor_copyout->size() != 2) {
+        throw nb::value_error("substep_sensor_copyout must have shape (2,)");
+      }
+      sensor_start = (*substep_sensor_copyout)[0];
+      sensor_stop = (*substep_sensor_copyout)[1];
+      if (sensor_start < 0 || sensor_start >= sensor_stop ||
+          sensor_stop > template_->nsensordata) {
+        throw nb::value_error(
+            "substep_sensor_copyout entries must satisfy 0 <= start < stop <= nsensordata");
+      }
+      if (!callback) throw nb::value_error("substep_sensor_copyout requires callback");
+    }
     auto sel = Parse(ids);
     mjtNum* hist = nullptr;
     if (history) {
       hist = HistoryPtr(*history, sel ? static_cast<int>(sel->size()) : num_sims_, nstep);
     }
     if (callback) {
-      RunCallback(std::move(sel), nstep, hist, *callback);
+      RunCallback(std::move(sel), nstep, hist, *callback, sensor_start,
+                  sensor_stop - sensor_start);
     } else {
       Run(Op::Step, std::move(sel), nstep, hist);
     }
@@ -743,6 +772,20 @@ class Batch {
     if (s.mirror) std::memcpy(s.mirror.get() + i * s.row, row, s.row);
   }
 
+  // Copy only the callback's declared sensordata columns into its bound view.
+  // Unlike CopyOut, this does not touch a mirror or columns outside the range.
+  void CopySensorRange(Slot& s, mjData* d, int i, int start, int width) {
+    uint8_t* row = s.buf.get() + i * s.row;
+    const mjtNum* src = d->sensordata + start;
+    if (s.f32 && sizeof(mjtNum) != sizeof(float)) {
+      auto* dst = reinterpret_cast<float*>(row) + start;
+      for (int k = 0; k < width; ++k) dst[k] = static_cast<float>(src[k]);
+    } else {
+      std::memcpy(row + static_cast<size_t>(start) * sizeof(mjtNum), src,
+                  static_cast<size_t>(width) * sizeof(mjtNum));
+    }
+  }
+
   void Restore(mjModel* m) {
     for (const FieldInfo* f : restorable_) std::memcpy(f->get(m), f->get(template_), f->bytes());
     m->npolygonmax = template_->npolygonmax;
@@ -827,6 +870,37 @@ class Batch {
         // with the state the sim stopped at rather than one substep behind.
         if (forward_ || cctx->tail_only) mj_forward(m, d);
         if (cctx->tail_only) std::memcpy(Warning(i), d->warning, sizeof(d->warning));
+        for (auto& s : bound_) CopyOut(*s, d, i);
+        return;
+      }
+      case Op::Substep1: {
+        // Position- and velocity-stage sensors are current with State(i) here.
+        // Input mirrors stay stale because Substep2 applies the callback writes.
+        mj_step1(m, d);
+        CopySensorRange(*cctx->sensor, d, i, cctx->sensor_start, cctx->sensor_width);
+        return;
+      }
+      case Op::Substep2: {
+        // A worker's mjData holds the last phase-one sim it visited, not a
+        // per-sim snapshot. Stage one is recomputed after State(i) and the
+        // callback writes have been loaded; the sensor view copied above is
+        // still the fresh result at x_k. Sync mirrors only after mj_step2.
+        mj_step1(m, d);
+        for (auto& s : bound_) {
+          if (s->mirror) {
+            std::memcpy(s->mirror.get() + i * s->row, s->buf.get() + i * s->row, s->row);
+          }
+        }
+        mj_step2(m, d);
+        if (cctx->hist) {
+          mj_getState(m, d, cctx->hist + static_cast<size_t>(cctx->k) * nstate_,
+                      mjSTATE_INTEGRATION);
+        }
+        mj_getState(m, d, State(i), mjSTATE_INTEGRATION);
+        std::memcpy(Warning(i), d->warning, sizeof(d->warning));
+        if (cctx->k + 1 != cctx->nstep) return;
+        cctx->done[0] = 1;
+        if (forward_) mj_forward(m, d);
         for (auto& s : bound_) CopyOut(*s, d, i);
         return;
       }
@@ -924,6 +998,30 @@ class Batch {
     }
   }
 
+  // The step1/step2 split is Euler-only. Expanded integrators are checked per
+  // selected simulation so a mixed batch fails closed before touching state.
+  void CheckEuler(const int* p, int n) {
+    const Slot* integrator = nullptr;
+    for (auto& s : expanded_) {
+      if (std::string_view(s->info->name) == "integrator") {
+        integrator = s.get();
+        break;
+      }
+    }
+    for (int j = 0; j < n; ++j) {
+      int i = p ? p[j] : j;
+      int value = template_->opt.integrator;
+      if (integrator) {
+        std::memcpy(&value, integrator->buf.get() + i * integrator->row, sizeof(value));
+      }
+      if (value != mjINT_EULER) {
+        throw nb::value_error(("sim " + std::to_string(i) +
+                               ": substep_sensor_copyout requires the Euler integrator")
+                                  .c_str());
+      }
+    }
+  }
+
   void RunLocked(Op op, const std::optional<std::vector<int>>& sel, int arg,
                  mjtNum* hist = nullptr, const QueryCtx* ctx = nullptr) {
     const int* p = sel ? sel->data() : nullptr;
@@ -951,17 +1049,21 @@ class Batch {
 
   // One substep for every selected sim that has not run its copy-out tail yet.
   void SubstepLocked(const int* p, int n, int k, int nstep, mjtNum* hist, uint8_t* done,
-                     bool tail_only) {
+                     bool tail_only, Op op = Op::Substep, Slot* sensor = nullptr,
+                     int sensor_start = 0, int sensor_width = 0) {
     CallbackCtx base;
     base.k = k;
     base.nstep = nstep;
     base.tail_only = tail_only;
+    base.sensor = sensor;
+    base.sensor_start = sensor_start;
+    base.sensor_width = sensor_width;
     auto fn = [&](int t, int j) {
       if (done[j]) return;
       CallbackCtx row = base;
       if (hist) row.hist = hist + static_cast<size_t>(j) * nstep * nstate_;
       row.done = done + j;
-      Guarded(t, p ? p[j] : j, Op::Substep, k, nullptr, nullptr, &row);
+      Guarded(t, p ? p[j] : j, op, k, nullptr, nullptr, &row);
     };
     if (pool_->size() == 1) {
       for (int j = 0; j < n; ++j) fn(0, j);
@@ -974,7 +1076,7 @@ class Batch {
   // callback before every substep, with the GIL held and every worker idle so
   // the views it passes are stable, then dispatches the substep to the pool.
   void RunCallback(std::optional<std::vector<int>> sel, int nstep, mjtNum* hist,
-                   nb::callable callback) {
+                   nb::callable callback, int sensor_start, int sensor_width) {
     {
       // Lock mu_ without the GIL: the callback needs the GIL while mu_ is held,
       // so blocking on mu_ with it could deadlock two callback-driven steps.
@@ -983,21 +1085,44 @@ class Batch {
     }
     std::unique_lock<std::mutex> lock(mu_, std::adopt_lock);
     Slot& ctrl = BoundOrAdd(Field(data_fields_, "ctrl"), false);
+    Slot* sensor = nullptr;
+    nb::object sensor_view;
+    if (sensor_width) sensor = &BoundOrAdd(Field(data_fields_, "sensordata"), false);
     // The views are built once per call, so the callback sees the same live
     // arrays every substep and the loop allocates nothing.
     nb::object state = nb::cast(StateView());
     nb::object ctrl_view = nb::cast(View(ctrl));
+    if (sensor) {
+      nb::object full = nb::cast(View(*sensor));
+      sensor_view = full.attr("__getitem__")(
+          nb::make_tuple(nb::slice(nb::none(), nb::none(), nb::none()),
+                         nb::slice(sensor_start, sensor_start + sensor_width)));
+    }
     const int* p = sel ? sel->data() : nullptr;
     const int n = sel ? static_cast<int>(sel->size()) : num_sims_;
     CheckSleep(p, n);
+    if (sensor_width) CheckEuler(p, n);
     error_.clear();
     std::vector<uint8_t> done(n, 0);
     int dispatched = 0, active = n;
     std::exception_ptr pending;
     for (int k = 0; k < nstep && active; ++k) {
+      if (sensor_width) {
+        {
+          nb::gil_scoped_release release;
+          SubstepLocked(p, n, k, nstep, hist, done.data(), false, Op::Substep1, sensor,
+                        sensor_start, sensor_width);
+        }
+        ++dispatched;
+        if (!error_.empty()) break;
+      }
       tls_callback = this;
       try {
-        callback(k, state, ctrl_view);
+        if (sensor_width) {
+          callback(k, state, ctrl_view, sensor_view);
+        } else {
+          callback(k, state, ctrl_view);
+        }
       } catch (...) {
         pending = std::current_exception();
       }
@@ -1005,7 +1130,9 @@ class Batch {
       if (pending) break;
       {
         nb::gil_scoped_release release;
-        SubstepLocked(p, n, k, nstep, hist, done.data(), false);
+        SubstepLocked(p, n, k, nstep, hist, done.data(), false,
+                      sensor_width ? Op::Substep2 : Op::Substep, sensor, sensor_start,
+                      sensor_width);
       }
       ++dispatched;
       if (!error_.empty()) break;

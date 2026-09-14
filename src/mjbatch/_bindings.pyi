@@ -71,10 +71,11 @@ class Batch:
 
     def expand(self, name: str, dtype: object | None = None) -> NDArray: ...
 
-    def step(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, nstep: int = 1, history: NDArray | None = None, *, callback: Callable | None = None) -> None:
+    def step(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None, nstep: int = 1, history: NDArray | None = None, *, callback: Callable | None = None, substep_sensor_copyout: Sequence[int] | None = None) -> None:
         """
         nstep mj_step calls per simulation, on one worker. ids: sorted unique ints or a bool mask. history: an optional caller-allocated (sims, nstep, nstate) array filled with each selected simulation's state after every substep, in bind("state") order; the rows of a simulation that raises are undefined.
         callback: fn(k, state, ctrl) invoked on the calling thread before substep k. k=0 gets the state from before the call; a later k gets the state after substep k-1. The views are live (num_sims, ...) batch rows built once per call: writes to ctrl apply to the substep that follows, writes to state at the next substep, like a state write between calls. Substeps are dispatched one at a time, so bound fields other than state stay stale until the call ends. Batch calls from inside the callback raise; an exception stops the simulations at the last completed substep, recoverably.
+        substep_sensor_copyout=(start, stop) opts into an Euler-only mj_step1/mj_step2 split. Before each callback, mj_step1 runs and the half-open sensordata column range is copied into a fourth live callback argument, sensor. Position- and velocity-stage sensors in that range are current with state; acceleration-stage values (including contact forces) are not available at this split point and may be stale. Writes to ctrl and bound input fields occur between step1 and step2, so they affect the current substep. If the callback raises, state remains at the last completed substep; intermediate mjData is recovered on the next call.
         """
 
     def forward(self, ids: Annotated[NDArray, dict(shape=(None,), order='C')] | None = None) -> None: ...

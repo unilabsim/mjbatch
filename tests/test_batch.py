@@ -563,6 +563,109 @@ def test_step_callback_initial_state(model):
     np.testing.assert_array_equal(seen[k], ref.bind("state"))
 
 
+@pytest.mark.parametrize("num_threads", [1, 4])
+@pytest.mark.parametrize("ids", [None, [1, 4, 6]])
+def test_split_substep_callback_matches_mj_step_split_reference(model, num_threads, ids):
+  """The opt-in split gives fresh stage-one sensors and exact mj_step2 results."""
+  batch = Batch(model, N, num_threads=num_threads)
+  xfrc = batch.bind("xfrc_applied")
+  selected = np.arange(N) if ids is None else np.array(ids)
+  nstep = 5
+  rng = np.random.default_rng(7)
+  ctrls = rng.uniform(-1, 1, (nstep, N, model.nu))
+  wrenches = rng.uniform(-0.5, 0.5, (nstep, N, 6))
+  sensors = []
+  history = np.empty((len(selected), nstep, batch.nstate))
+
+  def apply_wrench(k, state, ctrl_view, sensor):
+    ctrl_view[:] = ctrls[k]
+    xfrc[:, 1, :] = wrenches[k]
+    sensors.append(sensor.copy())
+
+  batch.step(
+    None if ids is None else selected,
+    nstep=nstep,
+    history=history,
+    callback=apply_wrench,
+    substep_sensor_copyout=(1, model.nsensordata),
+  )
+
+  datas = [mujoco.MjData(model) for _ in range(N)]
+  for d in datas:
+    mujoco.mj_forward(model, d)
+  state = np.empty(batch.nstate)
+  for k in range(nstep):
+    for j, i in enumerate(selected):
+      d = datas[i]
+      mujoco.mj_step1(model, d)
+      np.testing.assert_array_equal(sensors[k][i], d.sensordata[1:], f"k={k}, sim={i}")
+      d.ctrl[:] = ctrls[k, i]
+      d.xfrc_applied[1] = wrenches[k, i]
+      mujoco.mj_step2(model, d)
+      mujoco.mj_getState(model, d, state, mujoco.mjtState.mjSTATE_INTEGRATION)
+      np.testing.assert_array_equal(history[j, k], state, f"k={k}, sim={i}")
+  for i in selected:
+    mujoco.mj_getState(model, datas[i], state, mujoco.mjtState.mjSTATE_INTEGRATION)
+    np.testing.assert_array_equal(batch.bind("state")[i], state, f"sim={i}")
+
+
+@pytest.mark.parametrize("num_threads", [1, 3])
+def test_split_substep_callback_error_keeps_completed_substeps(model, num_threads):
+  batch = Batch(model, N, num_threads=num_threads)
+  xfrc = batch.bind("xfrc_applied")
+  time, qpos = batch.bind("time"), batch.bind("qpos")
+
+  def cb(k, state, ctrl_view, sensor):
+    ctrl_view[:] = 0.25
+    xfrc[:, 1, 2] = 0.125
+    if k == 2:
+      raise ValueError("boom")
+
+  with pytest.raises(ValueError, match="boom"):
+    batch.step(nstep=6, callback=cb, substep_sensor_copyout=(1, model.nsensordata))
+
+  np.testing.assert_allclose(time, 2 * 0.002)
+  data = mujoco.MjData(model)
+  data.ctrl[:] = 0.25
+  data.xfrc_applied[1, 2] = 0.125
+  for _ in range(2):
+    mujoco.mj_step1(model, data)
+    mujoco.mj_step2(model, data)
+  np.testing.assert_array_equal(qpos, np.tile(data.qpos, (N, 1)))
+  batch.step()
+  mujoco.mj_step(model, data)
+  np.testing.assert_array_equal(qpos, np.tile(data.qpos, (N, 1)))
+  np.testing.assert_allclose(time, 3 * 0.002)
+
+
+def test_split_substep_callback_rejects_rk4(model):
+  rk4 = mujoco.MjModel.from_xml_string(XML.replace("<option", '<option integrator="RK4"'))
+  batch = Batch(rk4, N)
+  with pytest.raises(ValueError, match="Euler"):
+    batch.step(callback=lambda k, s, c, sensor: None, substep_sensor_copyout=(0, 1))
+
+  mixed = Batch(model, N)
+  mixed.expand("integrator")[0] = mujoco.mjtIntegrator.mjINT_RK4
+  with pytest.raises(ValueError, match="sim 0.*Euler"):
+    mixed.step(callback=lambda k, s, c, sensor: None, substep_sensor_copyout=(0, 1))
+
+
+def test_substep_sensor_copyout_validation(model):
+  batch = Batch(model, N)
+
+  def cb(k, state, ctrl, sensor):
+    pass
+
+  with pytest.raises(ValueError, match="shape \\(2,\\)"):
+    batch.step(callback=cb, substep_sensor_copyout=(1,))
+  with pytest.raises(ValueError, match="0 <= start < stop"):
+    batch.step(callback=cb, substep_sensor_copyout=(2, 2))
+  with pytest.raises(ValueError, match="<= nsensordata"):
+    batch.step(callback=cb, substep_sensor_copyout=(0, model.nsensordata + 1))
+  with pytest.raises(ValueError, match="requires callback"):
+    batch.step(substep_sensor_copyout=(0, 1))
+
+
 def test_sleep_is_rejected():
   xml = LOCKSTEP_XML.replace("<option", '<option><flag sleep="enable"/></option><option')
   with pytest.raises(ValueError, match="sleep"):

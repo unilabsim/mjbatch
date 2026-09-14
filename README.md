@@ -14,6 +14,7 @@ Features include:
 * Explicit topology-affine groups, with `ModelAffineBatch` routing global ids to incompatible layouts.
 * Batched queries beyond stepping: site Jacobians with `jac_site` and heightfield sampling with `sample_hfield` (world/yaw grid alignment); query ops return caller-allocated results without refreshing the bound views.
 * Per-substep control from Python with `step(..., callback=...)`.
+* Opt-in split substeps with fresh position/velocity sensor views for body wrench control.
 * Optional per-worker CPU pinning on Linux, with `cpu_ids` binding pool worker `i` to `cpu_ids[i]`.
 
 For example:
@@ -30,6 +31,25 @@ for _ in range(1000):
   ctrl[:] = policy(qpos)             # your controller, all 4096 at once
   batch.step()                       # step them in parallel; qpos updates in place
 ```
+
+Callbacks can also consume tracked sensors at the exact state they are controlling. With
+Euler, `substep_sensor_copyout=(start, stop)` splits each substep at `mj_step1` /
+`mj_step2`, copies the declared sensor columns into a fourth callback view, and applies
+`ctrl` plus bound inputs such as `xfrc_applied` to that substep:
+
+```python
+xfrc = batch.bind("xfrc_applied")
+
+def control(k, state, ctrl, sensor):
+  ctrl[:] = impedance(sensor)       # position/velocity sensors match state
+  xfrc[:, body_id] = wrench(sensor)
+
+batch.step(callback=control, substep_sensor_copyout=(sensor_start, sensor_stop))
+```
+
+Acceleration-stage sensors and contact forces are not available before `mj_step2` and may
+be stale in that view. The default callback path and all outputs are unchanged unless the
+optional range is passed.
 
 ## Model randomization and variants
 
